@@ -1,0 +1,23 @@
+# safetorrent settings. Lives at ~/.config/safetorrent/config (readable only by you).
+
+# Free key from https://www.virustotal.com (sign up > your avatar > API key).
+# Lets the scan check programs/archives against ~70 antivirus engines.
+VT_API_KEY=
+# Max files looked up per torrent (free tier = 4/minute, so 20 takes ~5 min).
+VT_MAX_LOOKUPS=20
+
+# Route torrent traffic through WireGuard with a kill switch.
+# Put your config at ~/.config/safetorrent/wg0.conf first (see README).
+USE_VPN=no
+
+# Where clean downloads are copied on your Mac.
+DOWNLOAD_DIR=~/Downloads/SafeTorrents
+
+# Minutes to keep seeding after a download finishes (0 = stop immediately).
+SEED_MINUTES=0
+# Give up if a download makes no progress for this long.
+STALL_TIMEOUT_MINUTES=15
+# How long to wait for a magnet link's file list.
+METADATA_TIMEOUT_SECONDS=300
+# Largest total size an archive may unpack to for scanning.
+MAX_EXTRACT_GB=50
