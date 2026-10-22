@@ -1,0 +1,58 @@
+# Lima VM for safetorrent: an isolated Linux box that downloads and scans
+# torrents. Nothing from the Mac is shared into it; files only move out when
+# the host-side `safetorrent release` copies a scanned download.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+cpus: 2
+memory: 3GiB   # ClamAV needs ~1.5GiB to load its signature database
+disk: 80GiB    # sparse: only uses Mac disk space as downloads fill it
+
+# Isolation: no shared folders, no containers, no SSH agent, no port forwards.
+mounts: []
+containerd:
+  system: false
+  user: false
+ssh:
+  forwardAgent: false
+  forwardX11: false
+portForwards:
+- guestIP: "0.0.0.0"
+  guestIPMustBeZero: false
+  proto: any
+  ignore: true
+- guestIP: "127.0.0.1"
+  proto: any
+  ignore: true
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ -f /var/lib/safetorrent/.provisioned ] && exit 0
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      aria2 clamav clamav-freshclam 7zip 7zip-rar file python3 \
+      wireguard-tools iptables curl ca-certificates
+    id torrent >/dev/null 2>&1 || useradd --system --home-dir /var/lib/safetorrent \
+      --create-home --shell /usr/sbin/nologin torrent
+    install -d -m 755 -o torrent -g torrent /var/lib/safetorrent /srv/quarantine
+    install -d -m 700 /etc/safetorrent /opt/safetorrent
+    systemctl enable --now clamav-freshclam
+    touch /var/lib/safetorrent/.provisioned
+
+probes:
+- description: "safetorrent tools installed"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 900s bash -c "until [ -f /var/lib/safetorrent/.provisioned ]; do sleep 5; done"; then
+      echo >&2 "provisioning did not finish"
+      exit 1
+    fi
+  hint: See /var/log/cloud-init-output.log in the guest
