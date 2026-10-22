@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SafeTorrent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --surface: #e9eef0;
+  --panel: #ffffff;
+  --ink: #15222c;
+  --muted: #5a6a76;
+  --line: #c9d3d8;
+  --clean: #12775a;
+  --warn: #a8690f;
+  --contain: #b3261e;
+  --active: #2c5aa0;
+  --track-idle: #dfe6e9;
+  --focus: #2c5aa0;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #0f161c;
+    --panel: #162028;
+    --ink: #e2e9ed;
+    --muted: #8d9eaa;
+    --line: #2a3843;
+    --clean: #3fbf90;
+    --warn: #e2a64b;
+    --contain: #f2695c;
+    --active: #6f9be6;
+    --track-idle: #22303a;
+    --focus: #6f9be6;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--surface);
+  color: var(--ink);
+  font-family: "Archivo", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+a { color: var(--active); }
+
+/* ---- header ---- */
+.top {
+  display: flex; align-items: center; gap: 20px;
+  padding: 18px 28px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.wordmark {
+  font-stretch: 125%; font-weight: 800; font-size: 20px; letter-spacing: -0.01em; margin: 0;
+}
+.gate {
+  margin-left: auto; display: flex; align-items: center; gap: 10px;
+  font-stretch: 112%; font-weight: 650; font-size: 14px;
+}
+.gate .lamp { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+.gate.allowed .lamp { background: var(--clean); box-shadow: 0 0 0 4px color-mix(in srgb, var(--clean) 20%, transparent); }
+.gate.blocked .lamp { background: var(--contain); box-shadow: 0 0 0 4px color-mix(in srgb, var(--contain) 20%, transparent); }
+.icon-btn {
+  border: 1px solid var(--line); background: transparent; border-radius: 8px;
+  padding: 6px 12px; cursor: pointer; font-size: 14px;
+}
+.icon-btn:hover { border-color: var(--muted); }
+
+/* ---- layout ---- */
+.layout {
+  display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 0;
+  min-height: calc(100vh - 67px);
+}
+.checks { padding: 24px 24px 40px 28px; border-right: 1px solid var(--line); }
+.main { padding: 24px 28px 60px; max-width: 980px; }
+h2 { font-stretch: 118%; font-weight: 750; font-size: 16px; margin: 0 0 4px; }
+.sub { color: var(--muted); font-size: 13.5px; margin: 0 0 16px; }
+
+/* ---- safety checks ---- */
+.check { display: grid; grid-template-columns: 18px 1fr; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); }
+.check:first-of-type { border-top: 0; }
+.mark { width: 14px; height: 14px; margin-top: 4px; border-radius: 50%; background: var(--clean); }
+.mark.warn { background: transparent; border: 3px solid var(--warn); }
+.mark.block { border-radius: 2px; background: var(--contain); transform: rotate(45deg) scale(.85); }
+.check-title { font-weight: 650; }
+.check-detail { color: var(--muted); font-size: 13.5px; }
+.check.block .check-title { color: var(--contain); }
+.check .fix { margin-top: 8px; }
+.blocked-note {
+  border-left: 3px solid var(--contain); padding: 8px 12px; margin: 0 0 16px;
+  background: color-mix(in srgb, var(--contain) 8%, transparent); font-size: 14px;
+}
+
+/* ---- buttons ---- */
+.btn {
+  border: 1px solid var(--ink); background: var(--ink); color: var(--panel);
+  border-radius: 8px; padding: 8px 16px; font-weight: 650; cursor: pointer; font-size: 14px;
+}
+.btn:hover { opacity: .88; }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.quiet { background: transparent; color: var(--ink); border-color: var(--line); }
+.btn.quiet:hover { border-color: var(--muted); opacity: 1; }
+.btn.danger { background: transparent; color: var(--contain); border-color: color-mix(in srgb, var(--contain) 45%, transparent); }
+.btn.small { padding: 5px 11px; font-size: 13px; }
+
+/* ---- intake ---- */
+.intake {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px;
+  margin-bottom: 32px; position: relative;
+}
+.intake.dragging { border-color: var(--active); border-style: dashed; }
+.intake.locked > *:not(.lock-msg) { opacity: .35; pointer-events: none; }
+.lock-msg { display: none; }
+.intake.locked .lock-msg {
+  position: absolute; inset: 0; display: grid; place-items: center; border-radius: 12px;
+  text-align: center; padding: 20px; font-weight: 650; color: var(--contain);
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+}
+.intake-row { display: flex; gap: 10px; }
+.magnet {
+  flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  background: var(--surface);
+}
+.options { display: flex; flex-wrap: wrap; gap: 14px 22px; margin-top: 14px; font-size: 14px; align-items: center; }
+.options label { display: flex; align-items: center; gap: 8px; }
+.options select, .options input[type=text], .field input, .field select {
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; background: var(--panel);
+}
+.options input[type=text] { width: 220px; }
+.filepick { color: var(--active); text-decoration: underline; cursor: pointer; background: none; border: 0; padding: 0; }
+.progress-note { margin-top: 12px; color: var(--muted); font-size: 14px; }
+
+/* ---- downloads ---- */
+.list-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+.list-head .spacer { flex: 1; }
+.item { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
+.item-top { display: flex; gap: 14px; align-items: flex-start; }
+.item-name { font-weight: 700; font-size: 15.5px; overflow-wrap: anywhere; }
+.item-facts { color: var(--muted); font-size: 13px; display: flex; gap: 14px; flex-wrap: wrap; }
+.verdict { margin-left: auto; font-stretch: 112%; font-weight: 750; font-size: 13px; white-space: nowrap; padding-top: 2px; }
+.verdict.clean { color: var(--clean); }
+.verdict.warn { color: var(--warn); }
+.verdict.bad { color: var(--contain); }
+
+/* The airlock: four chambers a download passes through. */
+.airlock { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 16px 0 10px; }
+.chamber { position: relative; }
+.chamber .bar {
+  height: 10px; border-radius: 3px; background: var(--track-idle); overflow: hidden; position: relative;
+}
+.chamber .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--active); transition: width .6s ease; }
+.chamber.done .fill { width: 100%; background: var(--clean); }
+.chamber.active .fill { background: var(--active); }
+.chamber.active.indeterminate .fill {
+  width: 100%; background: repeating-linear-gradient(90deg, var(--active) 0 18px, transparent 18px 30px);
+  animation: slide 1.2s linear infinite; background-size: 30px 100%;
+}
+.chamber.held .fill {
+  width: 100%;
+  background: repeating-linear-gradient(135deg, var(--warn) 0 6px, color-mix(in srgb, var(--warn) 25%, transparent) 6px 12px);
+}
+.chamber.fail .fill { width: 100%; background: var(--contain); }
+@keyframes slide { to { background-position: 30px 0; } }
+.chamber .label { font-size: 12.5px; margin-top: 6px; font-weight: 650; }
+.chamber .state { font-size: 12.5px; color: var(--muted); }
+.chamber.fail .state { color: var(--contain); }
+.chamber.held .state { color: var(--warn); }
+
+.item-msg { font-size: 14px; margin: 4px 0 0; }
+.item-msg.err { color: var(--contain); }
+.item-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+.details-toggle { background: none; border: 0; color: var(--active); cursor: pointer; padding: 0; font-size: 13.5px; margin-left: auto; }
+.details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; font-size: 14px; }
+.findings { list-style: none; padding: 0; margin: 0 0 12px; }
+.findings li { display: grid; grid-template-columns: 16px 1fr; gap: 8px; padding: 3px 0; }
+.findings .dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 7px; background: var(--line); }
+.findings .l1 .dot { background: var(--warn); }
+.findings .l2 .dot, .findings .l3 .dot { background: var(--contain); }
+.findings .path { color: var(--muted); overflow-wrap: anywhere; }
+.files { font-size: 13px; color: var(--muted); max-height: 200px; overflow: auto; }
+.files div { display: flex; gap: 12px; }
+.files .size { min-width: 72px; text-align: right; }
+.force-row { display: flex; gap: 8px; align-items: center; font-size: 13.5px; color: var(--contain); }
+
+.empty { border: 1px dashed var(--line); border-radius: 12px; padding: 36px; text-align: center; color: var(--muted); }
+
+/* ---- dialogs ---- */
+dialog {
+  border: 1px solid var(--line); border-radius: 14px; padding: 0; width: min(560px, calc(100vw - 32px));
+  background: var(--panel); color: var(--ink);
+}
+dialog::backdrop { background: rgba(10, 18, 24, .45); }
+.dlg { padding: 24px; }
+.dlg h2 { font-size: 18px; margin-bottom: 12px; }
+.dlg ol { padding-left: 20px; margin: 0 0 16px; }
+.dlg ol li { margin-bottom: 6px; }
+.dlg-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+.field { margin-bottom: 16px; }
+.field > label { display: block; font-weight: 650; margin-bottom: 4px; }
+.field input[type=text], .field input[type=password] { width: 100%; }
+.field .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.switch { display: flex; gap: 10px; align-items: center; }
+.dropfile {
+  border: 1px dashed var(--line); border-radius: 10px; padding: 22px; text-align: center; color: var(--muted);
+}
+.dropfile.dragging { border-color: var(--active); color: var(--active); }
+hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+
+/* ---- toasts + banners ---- */
+.toasts { position: fixed; left: 20px; bottom: 20px; display: grid; gap: 8px; z-index: 10; max-width: 440px; }
+.toast { background: var(--ink); color: var(--panel); padding: 10px 14px; border-radius: 8px; font-size: 14px; }
+.toast.err { background: var(--contain); color: #fff; }
+.banner { padding: 10px 28px; font-size: 14px; background: color-mix(in srgb, var(--active) 12%, var(--panel)); border-bottom: 1px solid var(--line); }
+.banner.bad { background: color-mix(in srgb, var(--contain) 12%, var(--panel)); }
+.hidden { display: none !important; }
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  .checks { border-right: 0; border-bottom: 1px solid var(--line); padding: 20px 16px; }
+  .main { padding: 20px 16px 60px; }
+  .top { padding: 14px 16px; }
+  .intake-row { flex-direction: column; }
+  .airlock { grid-template-columns: repeat(2, 1fr); row-gap: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chamber .fill { transition: none; }
+  .chamber.active.indeterminate .fill { animation: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <h1 class="wordmark">SafeTorrent</h1>
+  <div class="gate" id="gate"><span class="lamp"></span><span id="gate-text">Connecting to the VM…</span></div>
+  <button class="icon-btn" id="open-settings" type="button">Settings</button>
+</header>
+<div id="banner" class="banner hidden"></div>
+
+<div class="layout">
+  <aside class="checks" aria-labelledby="checks-h">
+    <h2 id="checks-h">Safety checks</h2>
+    <p class="sub">Downloads can't start until every red check is fixed.</p>
+    <div id="checks"></div>
+    <button class="btn quiet small" id="recheck" type="button" style="margin-top:12px">Check again</button>
+  </aside>
+
+  <main class="main">
+    <section class="intake" id="intake" aria-labelledby="intake-h">
+      <h2 id="intake-h">Check a torrent</h2>
+      <p class="sub">SafeTorrent reads the file list first and nothing downloads until that check passes. Downloads go into a sealed VM and only reach your Mac after a clean scan.</p>
+      <form id="add-form" class="intake-row">
+        <input class="magnet" id="magnet" type="text" autocomplete="off" spellcheck="false"
+               placeholder="Paste a magnet link" aria-label="Magnet link">
+        <button class="btn" id="add-btn" type="submit">Check torrent</button>
+      </form>
+      <div class="options">
+        <span>or <button type="button" class="filepick" id="pick-torrent">choose a .torrent file</button>
+          <span id="picked" class="sub" style="margin:0"></span></span>
+        <input type="file" id="torrent-file" accept=".torrent,application/x-bittorrent" class="hidden">
+        <label>Type
+          <select id="category">
+            <option value="">Detect automatically</option>
+            <option value="media">Movies, TV and music</option>
+            <option value="software">Software and games</option>
+            <option value="docs">Books and documents</option>
+            <option value="iso">Disk image (ISO)</option>
+          </select>
+        </label>
+        <label>Publisher's SHA-256 <input type="text" id="sha256" placeholder="Optional" spellcheck="false"></label>
+        <label><input type="checkbox" id="auto-start" checked> Start when the check passes</label>
+        <label><input type="checkbox" id="auto-release" checked> Copy to my Mac when the scan is clean</label>
+      </div>
+      <div class="progress-note hidden" id="add-note"></div>
+      <div class="lock-msg" id="lock-msg"></div>
+    </section>
+
+    <section aria-labelledby="list-h">
+      <div class="list-head">
+        <h2 id="list-h">Downloads</h2>
+        <span class="sub" style="margin:0" id="free"></span>
+        <span class="spacer"></span>
+        <button class="btn quiet small" id="open-downloads" type="button">Open downloads folder</button>
+      </div>
+      <div id="items"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="vpn-dlg">
+  <form method="dialog" class="dlg" id="vpn-form">
+    <h2>Import a Proton VPN file</h2>
+    <ol>
+      <li>Open <a href="https://account.protonvpn.com" target="_blank" rel="noopener">account.protonvpn.com</a> and choose <b>WireGuard</b> in the sidebar.</li>
+      <li>Pick <b>GNU/Linux</b>, expand a country, and choose a server with the P2P icon (two arrows). Avoid servers with the globe icon.</li>
+      <li>Click <b>Create</b>, download the file, and drop it below.</li>
+    </ol>
+    <div class="dropfile" id="vpn-drop">Drop the .conf file here, or <button type="button" class="filepick" id="vpn-pick">choose it</button></div>
+    <input type="file" id="vpn-file" accept=".conf" class="hidden">
+    <p class="sub" id="vpn-status" style="margin:12px 0 0"></p>
+    <p class="sub" style="margin:8px 0 0">SafeTorrent tests the file before using it, and keeps your previous one if Proton rejects it. Delete the download from your Downloads folder afterwards, because it contains your VPN key.</p>
+    <div class="dlg-actions"><button class="btn quiet" value="close">Close</button></div>
+  </form>
+</dialog>
+
+<dialog id="settings-dlg">
+  <form class="dlg" id="settings-form">
+    <h2>Settings</h2>
+    <div class="field">
+      <label for="vt-key">VirusTotal API key</label>
+      <input type="password" id="vt-key" autocomplete="off" spellcheck="false">
+      <div class="hint" id="vt-hint">Free at virustotal.com (your avatar, then API key). Lets programs and archives be checked by about 70 antivirus engines.</div>
+    </div>
+    <div class="field">
+      <label>Proton VPN</label>
+      <div class="switch"><input type="checkbox" id="use-vpn"><label for="use-vpn" style="font-weight:400">Send all torrent traffic through the VPN, and stop if it drops</label></div>
+      <div class="hint" id="vpn-hint"></div>
+      <button type="button" class="btn quiet small" id="open-vpn-import" style="margin-top:8px">Import new Proton file</button>
+    </div>
+    <div class="field">
+      <label for="dl-dir">Folder for clean downloads</label>
+      <input type="text" id="dl-dir" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="seed">Keep sharing after a download finishes (minutes)</label>
+      <input type="text" id="seed" inputmode="numeric" style="width:100px">
+      <div class="hint">0 stops sharing as soon as the download finishes.</div>
+    </div>
+    <div class="dlg-actions">
+      <button type="button" class="btn quiet" id="settings-cancel">Cancel</button>
+      <button type="submit" class="btn">Save settings</button>
+    </div>
+    <hr>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <button type="button" class="btn quiet small" id="update-btn">Update virus definitions</button>
+      <button type="button" class="btn danger small" id="quit-btn">Stop the VM and quit</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// The launcher opens us with #t=<token>; keep it for this tab and scrub it from the URL.
+(() => {
+  const m = location.hash.match(/t=([\w-]+)/);
+  if (m) { sessionStorage.setItem("st-token", m[1]); history.replaceState(null, "", location.pathname); }
+})();
+const TOKEN = sessionStorage.getItem("st-token") || "";
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: { "X-Safetorrent-Token": TOKEN, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({ error: "The SafeTorrent server didn't answer." }));
+  if (!res.ok || data.error) throw new Error(data.error || "Something went wrong.");
+  return data;
+}
+
+function toast(msg, err = false) {
+  const el = document.createElement("div");
+  el.className = "toast" + (err ? " err" : "");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), err ? 9000 : 4500);
+}
+
+function human(n) {
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : n) + " " + u[i];
+}
+
+let S = null;                 // latest server state
+const openDetails = new Set();
+const forceChecked = new Set();
+
+/* ---------------- safety checks ---------------- */
+
+const FIX_LABEL = {
+  import_vpn: "Import new Proton file", enable_vpn: "Turn on the VPN",
+  update: "Update now", settings: "Open settings",
+};
+
+function renderChecks() {
+  const h = S.health;
+  const gate = $("gate");
+  if (S.vm !== "Running") {
+    gate.className = "gate";
+    $("gate-text").textContent = S.busy.vm ? "Starting the VM…" : "VM is " + S.vm.toLowerCase();
+    $("checks").innerHTML = `<p class="sub">The safety VM isn't running.</p>
+      <button class="btn small" data-fix="vm">Start it</button>`;
+    return;
+  }
+  if (!h) {
+    $("checks").innerHTML = `<p class="sub">${esc(S.health_error || "Running the checks…")}</p>`;
+    return;
+  }
+  gate.className = "gate " + (h.blocked ? "blocked" : "allowed");
+  const vpn = h.checks.find((c) => c.id === "vpn");
+  $("gate-text").textContent = h.blocked ? "Downloads blocked"
+    : "Downloads allowed" + (vpn && vpn.state === "ok" ? ", through Proton" : "");
+  $("checks").innerHTML = h.checks.map((c) => `
+    <div class="check ${c.state}">
+      <span class="mark ${c.state}" aria-label="${c.state === "ok" ? "passed" : c.state === "warn" ? "warning" : "blocking"}"></span>
+      <div>
+        <div class="check-title">${esc(c.title)}</div>
+        <div class="check-detail">${esc(c.detail)}</div>
+        ${c.fix && FIX_LABEL[c.fix] && c.state !== "ok" ? `<div class="fix"><button class="btn small ${c.state === "block" ? "" : "quiet"}" data-fix="${c.fix}"
+          ${S.busy[c.fix] ? "disabled" : ""}>${esc(S.busy[c.fix] || FIX_LABEL[c.fix])}</button></div>` : ""}
+      </div>
+    </div>`).join("");
+}
+
+function renderIntake() {
+  const h = S.health;
+  const blocked = S.vm !== "Running" || !h || h.blocked;
+  $("intake").classList.toggle("locked", blocked);
+  if (blocked) {
+    const first = h && h.checks.find((c) => c.state === "block");
+    $("lock-msg").textContent = S.vm !== "Running" ? "Waiting for the safety VM to start."
+      : !h ? "Running the safety checks…"
+      : `Downloads are blocked until this is fixed: ${first.title}.`;
+  }
+  const adding = S.busy.add;
+  $("add-btn").disabled = !!adding;
+  $("add-note").classList.toggle("hidden", !adding);
+  if (adding) $("add-note").textContent = adding + "… Magnet links can take a minute or two while peers are found.";
+}
+
+/* ---------------- downloads ---------------- */
+
+const VERDICT = {
+  CLEAN: ["Clean", "clean"], WARNING: ["Needs a look", "warn"], SUSPICIOUS: ["Suspicious", "bad"],
+  INFECTED: ["Infected", "bad"], REJECTED: ["Rejected before download", "bad"], OK: ["", ""],
+};
+
+function chambers(m) {
+  const pre = m.precheck.verdict;
+  const verdict = m.scan && m.scan.verdict;
+  const releasing = S.busy["release:" + m.id];
+  const c = [
+    { label: "File list checked", cls: pre === "OK" ? "done" : pre === "WARNING" ? "held" : "fail",
+      state: pre === "OK" ? "Passed" : pre === "WARNING" ? "Warnings" : "Rejected" },
+    { label: "Quarantine", cls: "", state: "Waiting" },
+    { label: "Scan", cls: "", state: "Waiting" },
+    { label: "On your Mac", cls: "", state: "Not yet" },
+  ];
+  const st = m.status;
+  if (["prechecked", "skipped"].includes(st) && pre !== "REJECTED") c[1].state = "Not started";
+  if (st === "queued") Object.assign(c[1], { cls: "active indeterminate", state: "Starting" });
+  if (st === "downloading") {
+    const p = m.progress;
+    Object.assign(c[1], p && p.seeding ? { cls: "done", state: "Downloaded, sharing" }
+      : p ? { cls: "active", state: `${p.percent}% downloaded`, pct: p.percent }
+      : { cls: "active indeterminate", state: "Finding peers" });
+  }
+  if (["incomplete", "vpn-failed", "blocked"].includes(st)) {
+    Object.assign(c[1], { cls: st === "incomplete" ? "held" : "fail", state: st === "incomplete" ? "Paused" : "Stopped" });
+  }
+  if (["downloaded", "scanning", "scanned", "released"].includes(st)) Object.assign(c[1], { cls: "done", state: "Downloaded" });
+  if (st === "downloaded") Object.assign(c[2], { cls: "held", state: "Not scanned" });
+  if (st === "scanning") Object.assign(c[2], { cls: "active indeterminate", state: m.phase || "Scanning" });
+  if (st === "scanned" || st === "released") {
+    Object.assign(c[2], verdict === "CLEAN" ? { cls: "done", state: "Clean" }
+      : verdict === "WARNING" ? { cls: "held", state: "Warnings" } : { cls: "fail", state: VERDICT[verdict][0] });
+  }
+  if (st === "scanned") {
+    if (releasing) Object.assign(c[3], { cls: "active indeterminate", state: "Copying" });
+    else if (verdict === "CLEAN") c[3].state = m.auto_release ? "Copying soon" : "Ready";
+    else if (verdict === "WARNING") Object.assign(c[3], { cls: "held", state: "Waiting for you" });
+    else Object.assign(c[3], { cls: "fail", state: "Kept in the VM" });
+  }
+  if (st === "released") Object.assign(c[3], { cls: "done", state: "Copied" });
+  return c;
+}
+
+function progressLine(m) {
+  const p = m.progress;
+  if (m.status === "downloading" && p && p.seeding) {
+    return `Finished. Sharing with ${p.peers || 0} peers for your set time before scanning (ratio ${p.ratio}).`;
+  }
+  if (m.status === "downloading" && p) {
+    const bits = [`${p.done} of ${p.total}`];
+    if (p.speed) bits.push(`${p.speed}/s`);
+    if (p.peers) bits.push(`${p.peers} peers`);
+    if (p.eta) bits.push(`${p.eta} left`);
+    return bits.join(", ");
+  }
+  if (m.status === "scanning") return m.phase ? m.phase + "…" : "Scanning…";
+  if (m.status === "released") return "Copied to " + m.released_to;
+  return "";
+}
+
+function actions(m) {
+  const id = m.id, v = m.scan && m.scan.verdict, st = m.status, pre = m.precheck.verdict;
+  const b = (act, label, cls = "quiet") => `<button class="btn small ${cls}" data-act="${act}" data-id="${id}">${label}</button>`;
+  const out = [];
+  if (["prechecked", "skipped"].includes(st)) out.push(b("start", pre === "WARNING" ? "Download anyway" : "Download into quarantine", ""));
+  if (st === "rejected") {
+    out.push(`<label class="force-row"><input type="checkbox" data-force="${id}" ${forceChecked.has(id) ? "checked" : ""}>
+      I understand the risk</label>`);
+    if (forceChecked.has(id)) out.push(b("force-start", "Download it anyway", "danger"));
+  }
+  if (["queued", "downloading", "scanning"].includes(st)) out.push(b("stop", st === "scanning" ? "Stop scan" : "Pause"));
+  if (["incomplete", "vpn-failed", "blocked"].includes(st)) out.push(b("start", "Resume", ""));
+  if (st === "downloaded") out.push(b("scan", "Scan now", ""));
+  if (st === "scanned" && v === "WARNING") out.push(b("release", "Copy to my Mac", ""));
+  if (st === "scanned" && v === "CLEAN" && !m.auto_release) out.push(b("release", "Copy to my Mac", ""));
+  if (st === "scanned" && (v === "SUSPICIOUS" || v === "INFECTED")) out.push(b("force-release", "Copy anyway", "danger"));
+  if (st === "released") out.push(b("reveal", "Show in Finder", ""));
+  if (["scanned", "released"].includes(st)) out.push(b("scan", "Scan again"));
+  if (!["queued", "downloading", "scanning"].includes(st)) {
+    out.push(b("delete", st === "released" ? "Remove from quarantine" : "Delete", "danger"));
+  }
+  return out.join("");
+}
+
+function findingsHtml(list) {
+  if (!list.length) return `<p class="sub" style="margin:0 0 12px">No problems found.</p>`;
+  return `<ul class="findings">` + [...list].sort((a, b) => b.level - a.level).map((f) => `
+    <li class="l${f.level}"><span class="dot"></span><span>${f.path ? `<span class="path">${esc(f.path)}</span><br>` : ""}${esc(f.msg)}</span></li>`
+  ).join("") + `</ul>`;
+}
+
+function renderItems() {
+  $("free").textContent = S.free ? `${human(S.free)} free in the VM` : "";
+  if (S.items_error) { $("items").innerHTML = `<div class="empty">${esc(S.items_error)}</div>`; return; }
+  if (!S.items.length) {
+    $("items").innerHTML = `<div class="empty">Nothing in quarantine yet. Paste a magnet link above and it'll be checked before anything downloads.</div>`;
+    return;
+  }
+  $("items").innerHTML = S.items.map((m) => {
+    const v = (m.scan && m.scan.verdict) || (m.precheck.verdict !== "OK" ? m.precheck.verdict : "OK");
+    const [vText, vCls] = VERDICT[v] || ["", ""];
+    const err = m.error && !["scanned", "released"].includes(m.status) ? m.error : S.errors[m.id];
+    const findings = m.scan ? m.scan.findings : m.precheck.findings;
+    const isOpen = openDetails.has(m.id) || ["prechecked", "rejected", "skipped"].includes(m.status) && !openDetails.has("closed:" + m.id);
+    const cats = { media: "Movies, TV or music", software: "Software", docs: "Books or documents", iso: "Disk image" };
+    return `<article class="item">
+      <div class="item-top">
+        <div>
+          <div class="item-name">${esc(m.name)}</div>
+          <div class="item-facts"><span>${human(m.total)}</span><span>${m.file_count} file${m.file_count === 1 ? "" : "s"}</span>
+            <span>${cats[m.category] || esc(m.category)}</span></div>
+        </div>
+        <div class="verdict ${vCls}">${esc(vText)}</div>
+      </div>
+      <div class="airlock">${chambers(m).map((c) => `
+        <div class="chamber ${c.cls}">
+          <div class="bar"><div class="fill" style="${c.pct != null ? `width:${c.pct}%` : ""}"></div></div>
+          <div class="label">${c.label}</div><div class="state">${esc(c.state)}</div>
+        </div>`).join("")}</div>
+      ${progressLine(m) ? `<p class="item-msg">${esc(progressLine(m))}</p>` : ""}
+      ${err ? `<p class="item-msg err">${esc(err)}</p>` : ""}
+      <div class="item-actions">${actions(m)}
+        <button class="details-toggle" data-toggle="${m.id}" aria-expanded="${isOpen}">${isOpen ? "Hide details" : "Details"}</button>
+      </div>
+      ${isOpen ? `<div class="details">
+        <h2 style="font-size:14px">${m.scan ? "Scan findings" : "What the file-list check found"}</h2>
+        ${findingsHtml(findings)}
+        <h2 style="font-size:14px">Largest files</h2>
+        <div class="files">${(m.files || []).slice(0, 60).map((f) =>
+          `<div><span class="size">${human(f.size)}</span><span>${esc(f.path)}</span></div>`).join("")}</div>
+      </div>` : ""}
+    </article>`;
+  }).join("");
+}
+
+function renderBanner() {
+  const b = $("banner");
+  const busy = Object.entries(S.busy).filter(([k]) => !k.startsWith("release:") && k !== "add");
+  if (S.vm === "Missing") {
+    b.className = "banner bad";
+    b.textContent = "The safety VM hasn't been created. Run: safetorrent setup";
+  } else if (busy.length) {
+    b.className = "banner";
+    b.textContent = busy.map(([, v]) => v + "…").join("  ");
+  } else {
+    b.className = "banner hidden";
+  }
+}
+
+function render() {
+  if (!S) return;
+  renderChecks(); renderIntake(); renderItems(); renderBanner();
+}
+
+async function poll() {
+  try {
+    S = await api("/api/state");
+    render();
+  } catch (e) {
+    $("gate-text").textContent = TOKEN ? e.message : "Open SafeTorrent from its app icon";
+  }
+  const busy = S && (S.items.some((m) => ["queued", "downloading", "scanning"].includes(m.status)) || Object.keys(S.busy).length);
+  setTimeout(poll, busy ? 1500 : 4000);
+}
+
+/* ---------------- events ---------------- */
+
+let torrentB64 = null;
+
+$("pick-torrent").onclick = () => $("torrent-file").click();
+$("torrent-file").onchange = () => loadTorrent($("torrent-file").files[0]);
+
+async function loadTorrent(file) {
+  if (!file) return;
+  if (!/\.torrent$/i.test(file.name)) return toast("That isn't a .torrent file.", true);
+  const buf = new Uint8Array(await file.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode(...buf.subarray(i, i + 8192));
+  torrentB64 = btoa(bin);
+  $("picked").textContent = file.name;
+  $("magnet").value = "";
+}
+
+$("add-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const magnet = $("magnet").value.trim();
+  if (!magnet && !torrentB64) return toast("Paste a magnet link or choose a .torrent file.", true);
+  const body = {
+    magnet: magnet || undefined, torrent_b64: magnet ? undefined : torrentB64,
+    category: $("category").value, sha256: $("sha256").value.trim(),
+    auto_start: $("auto-start").checked, auto_release: $("auto-release").checked,
+  };
+  S.busy.add = "Reading the torrent's file list"; renderIntake();
+  try {
+    const m = await api("/api/add", body);
+    $("magnet").value = ""; $("sha256").value = ""; torrentB64 = null; $("picked").textContent = "";
+    if (m.existed) toast("You already have this one; it's in the list.");
+    else if (m.started) toast("The file list looks fine, so it's downloading into quarantine.");
+    else if (m.precheck.verdict === "REJECTED") toast("Rejected: this torrent shows signs of malware. Nothing was downloaded.", true);
+    else if (m.precheck.verdict === "WARNING") toast("Check the warnings before downloading.");
+    openDetails.add(m.id);
+  } catch (err) { toast(err.message, true); }
+  delete S.busy.add;
+  poll();
+};
+
+// Drag a .torrent anywhere onto the intake box.
+const intake = $("intake");
+intake.addEventListener("dragover", (e) => { e.preventDefault(); intake.classList.add("dragging"); });
+intake.addEventListener("dragleave", () => intake.classList.remove("dragging"));
+intake.addEventListener("drop", (e) => {
+  e.preventDefault(); intake.classList.remove("dragging");
+  loadTorrent(e.dataTransfer.files[0]);
+});
+
+$("items").addEventListener("change", (e) => {
+  const id = e.target.dataset.force;
+  if (!id) return;
+  e.target.checked ? forceChecked.add(id) : forceChecked.delete(id);
+  renderItems();
+});
+
+$("items").addEventListener("click", async (e) => {
+  const t = e.target.closest("button");
+  if (!t) return;
+  if (t.dataset.toggle) {
+    const id = t.dataset.toggle;
+    if (t.getAttribute("aria-expanded") === "true") { openDetails.delete(id); openDetails.add("closed:" + id); }
+    else { openDetails.add(id); openDetails.delete("closed:" + id); }
+    return renderItems();
+  }
+  const { act, id } = t.dataset;
+  if (!act) return;
+  const m = S.items.find((x) => x.id === id);
+  if (act === "delete" && !confirm(`Delete "${m.name}" from quarantine?`)) return;
+  if (act === "force-release" && !confirm(`The scan flagged "${m.name}" as ${m.scan.verdict.toLowerCase()}. Copy it to your Mac anyway?`)) return;
+  const map = {
+    start: ["start", {}], "force-start": ["start", { force: true }], stop: ["stop", {}], scan: ["scan", {}],
+    release: ["release", {}], "force-release": ["release", { force: true }], delete: ["delete", {}], reveal: ["reveal", {}],
+  };
+  const [action, body] = map[act];
+  t.disabled = true;
+  try {
+    await api(`/api/items/${id}/${action}`, body);
+    if (action === "release") toast("Copied to your Mac.");
+  } catch (err) { toast(err.message, true); }
+  poll();
+});
+
+$("checks").addEventListener("click", async (e) => {
+  const fix = e.target.dataset && e.target.dataset.fix;
+  if (!fix) return;
+  if (fix === "import_vpn") return openVpn();
+  if (fix === "settings") return openSettings(true);
+  e.target.disabled = true;
+  try {
+    if (fix === "vm") await api("/api/vm/start", {});
+    if (fix === "update") { await api("/api/update", {}); toast("Updating virus definitions. This takes a minute or two."); }
+    if (fix === "enable_vpn") {
+      if (!S.settings.vpn_config_present) return openVpn();
+      await api("/api/settings", { use_vpn: true });
+      toast("VPN turned on.");
+    }
+  } catch (err) { toast(err.message, true); }
+  poll();
+});
+
+$("recheck").onclick = async () => {
+  $("recheck").disabled = true; $("recheck").textContent = "Checking…";
+  try { S = await api("/api/refresh", {}); render(); } catch (err) { toast(err.message, true); }
+  $("recheck").disabled = false; $("recheck").textContent = "Check again";
+};
+
+$("open-downloads").onclick = () => api("/api/open-downloads", {}).catch((err) => toast(err.message, true));
+
+/* VPN import */
+function openVpn() { $("vpn-status").textContent = ""; $("vpn-dlg").showModal(); }
+$("vpn-pick").onclick = () => $("vpn-file").click();
+$("vpn-file").onchange = () => importVpn($("vpn-file").files[0]);
+const vd = $("vpn-drop");
+vd.addEventListener("dragover", (e) => { e.preventDefault(); vd.classList.add("dragging"); });
+vd.addEventListener("dragleave", () => vd.classList.remove("dragging"));
+vd.addEventListener("drop", (e) => { e.preventDefault(); vd.classList.remove("dragging"); importVpn(e.dataTransfer.files[0]); });
+
+async function importVpn(file) {
+  if (!file) return;
+  $("vpn-status").textContent = "Testing the connection through Proton…";
+  try {
+    await api("/api/vpn/import", { conf_text: await file.text() });
+    $("vpn-status").textContent = "It works. Torrent traffic now goes through this server.";
+    toast("New VPN file is working.");
+    setTimeout(() => $("vpn-dlg").close(), 1500);
+  } catch (err) {
+    $("vpn-status").textContent = err.message;
+  }
+  $("vpn-file").value = "";
+  poll();
+}
+
+/* Settings */
+function openSettings(focusKey = false) {
+  const s = S.settings;
+  $("vt-key").value = "";
+  $("vt-key").placeholder = s.vt_key_set ? `Saved key ending ${s.vt_key_hint}. Paste a new one to replace it` : "Paste your API key";
+  $("use-vpn").checked = s.use_vpn;
+  $("vpn-hint").textContent = s.vpn_config_present ? "A Proton file is imported." : "No Proton file imported yet.";
+  $("dl-dir").value = s.download_dir;
+  $("seed").value = s.seed_minutes;
+  $("settings-dlg").showModal();
+  if (focusKey) $("vt-key").focus();
+}
+$("open-settings").onclick = () => S && openSettings();
+$("settings-cancel").onclick = () => $("settings-dlg").close();
+$("open-vpn-import").onclick = () => { $("settings-dlg").close(); openVpn(); };
+$("settings-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const body = { use_vpn: $("use-vpn").checked, download_dir: $("dl-dir").value, seed_minutes: $("seed").value };
+  if ($("vt-key").value.trim()) body.vt_key = $("vt-key").value.trim();
+  try {
+    await api("/api/settings", body);
+    $("settings-dlg").close();
+    toast("Settings saved.");
+  } catch (err) { toast(err.message, true); }
+  poll();
+};
+$("update-btn").onclick = async () => {
+  try { await api("/api/update", {}); toast("Updating virus definitions. This takes a minute or two."); $("settings-dlg").close(); }
+  catch (err) { toast(err.message, true); }
+};
+$("quit-btn").onclick = async () => {
+  if (S.items.some((m) => ["downloading", "scanning", "queued"].includes(m.status)) &&
+      !confirm("A download or scan is running. Stopping the VM pauses it. Quit anyway?")) return;
+  await api("/api/quit", { stop_vm: true }).catch(() => {});
+  document.body.innerHTML = `<div class="empty" style="margin:40px">SafeTorrent has stopped. Open it again from its app icon.</div>`;
+};
+
+poll();
+</script>
+</body>
+</html>
