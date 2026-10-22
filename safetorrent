@@ -1,0 +1,268 @@
+#!/bin/bash
+# safetorrent: download torrents inside an isolated Linux VM, scan them, and
+# only copy them to this Mac once they come back clean.
+set -euo pipefail
+
+VM=safetorrent
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+CONF_DIR="$HOME/.config/safetorrent"
+CONF="$CONF_DIR/config"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die() { printf '\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+safetorrent: quarantine, scan, then release torrents
+
+  safetorrent get "<magnet link>" | file.torrent [options]
+      --category media|software|docs|iso   override auto-detection
+      --sha256 HASH    verify against a publisher's checksum (Linux ISOs etc.)
+      --yes            don't ask before downloading when there are warnings
+      --force          download even if the pre-check rejects it
+      --no-release     keep it in quarantine even if it's clean
+  safetorrent list                 everything in quarantine
+  safetorrent report <id>          full scan report
+  safetorrent release <id> [--force]  copy to your Mac (--force for SUSPICIOUS/INFECTED)
+  safetorrent resume <id>          continue a stopped download
+  safetorrent rescan <id>          scan again (e.g. after `update`)
+  safetorrent purge <id>|all       delete from quarantine
+  safetorrent vpn                  show VPN status and the IP peers see
+  safetorrent vpn-import <file>    swap in a new Proton WireGuard file (rolls back if it fails)
+  safetorrent health               the safety checks that must pass before downloading
+  safetorrent stop <id>            pause a background download
+  safetorrent gui                  open the web app
+  safetorrent update               refresh virus definitions + VM security updates
+  safetorrent doctor               check everything is installed
+  safetorrent setup                first-time install (VM, config, command)
+  safetorrent start | stop | shell manage the VM (stop with an id pauses that download)
+EOF
+}
+
+load_config() {
+  DOWNLOAD_DIR="$HOME/Downloads/SafeTorrents"
+  USE_VPN=no
+  if [[ -f "$CONF" ]]; then
+    local line
+    line=$(grep -E '^[[:space:]]*(DOWNLOAD_DIR|USE_VPN)=' "$CONF" || true)
+    while IFS='=' read -r key value; do
+      value="${value%%#*}"; value="${value%"${value##*[![:space:]]}"}"
+      value="${value%\"}"; value="${value#\"}"; value="${value/#\~/$HOME}"
+      case "${key// /}" in
+        DOWNLOAD_DIR) DOWNLOAD_DIR="$value" ;;
+        USE_VPN) USE_VPN="$value" ;;
+      esac
+    done <<< "$line"
+  fi
+}
+
+vm_status() { limactl list --format '{{.Status}}' "$VM" 2>/dev/null || true; }
+
+ensure_vm() {
+  command -v limactl >/dev/null || die "Lima isn't installed. Run: safetorrent setup"
+  case "$(vm_status)" in
+    Running) ;;
+    Stopped) echo "Starting the safetorrent VM…"; limactl start "$VM" >/dev/null 2>&1 ;;
+    *) die "the VM doesn't exist yet. Run: safetorrent setup" ;;
+  esac
+}
+
+# Copy the agent, config and any extra files into the VM's inbox (~/st-in).
+push() {
+  local stage
+  stage=$(mktemp -d)
+  cp "$ROOT/vm/st-guest.py" "$stage/"
+  [[ -f "$CONF" ]] && cp "$CONF" "$stage/config"
+  if [[ -f "$CONF_DIR/wg0.conf" ]]; then cp "$CONF_DIR/wg0.conf" "$stage/"; else touch "$stage/no-vpn-config"; fi
+  for extra in "$@"; do cp "$extra" "$stage/"; done
+  limactl copy "$stage"/* "$VM:st-in/" >/dev/null
+  rm -rf "$stage"
+}
+
+# Run the VM agent as root. A freshly pushed agent is installed to /opt first
+# (root-owned, so background jobs never run a file the VM user could edit).
+guest() {
+  limactl shell --workdir / "$VM" -- sh -c '
+    cd
+    if [ -f st-in/st-guest.py ]; then
+      sudo install -D -m 755 st-in/st-guest.py /opt/safetorrent/st-guest.py && rm st-in/st-guest.py
+    fi
+    exec sudo python3 /opt/safetorrent/st-guest.py "$@"' st-guest "$@"
+}
+
+# Swap in a new WireGuard file; roll back if Proton doesn't accept it.
+cmd_vpn_import() {
+  local file=${1:?usage: safetorrent vpn-import <file.conf>}
+  [[ -f "$file" ]] || die "no such file: $file"
+  grep -q '^\[Interface\]' "$file" && grep -q '^\[Peer\]' "$file" && grep -qi '^PrivateKey' "$file" \
+    && grep -qi '^Endpoint' "$file" || die "that isn't a WireGuard config (download the GNU/Linux one from Proton)"
+  mkdir -p "$CONF_DIR"
+  local backup=""
+  if [[ -f "$CONF_DIR/wg0.conf" ]]; then backup="$CONF_DIR/wg0.conf.previous"; cp "$CONF_DIR/wg0.conf" "$backup"; fi
+  install -m 600 "$file" "$CONF_DIR/wg0.conf"
+  set_config USE_VPN yes
+  ensure_vm; push
+  echo "Testing the new VPN config…"
+  if guest vpn; then
+    rm -f "$backup"
+    [[ "$file" == "$HOME/Downloads/"* ]] && rm -f "$file"   # don't leave the private key lying around
+    printf '\033[32mNew VPN config is working.\033[0m\n'
+  else
+    if [[ -n "$backup" ]]; then mv "$backup" "$CONF_DIR/wg0.conf"; else rm -f "$CONF_DIR/wg0.conf"; fi
+    push; guest vpn >/dev/null 2>&1 || true
+    die "Proton didn't accept that config, so the previous one was kept. Make sure you chose GNU/Linux and a P2P server."
+  fi
+}
+
+set_config() {
+  local key=$1 value=$2
+  touch "$CONF"; chmod 600 "$CONF"
+  if grep -qE "^[[:space:]]*$key=" "$CONF"; then
+    local tmp; tmp=$(mktemp)
+    awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $0 ~ "^[[:space:]]*"k"=" {print k"="v; next} {print}' "$CONF" > "$tmp"
+    cat "$tmp" > "$CONF"; rm -f "$tmp"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$CONF"
+  fi
+}
+
+release() {
+  local id=$1 force=${2:-} info rid status verdict name
+  info=$(guest release-info "$id") || exit 1
+  IFS=$'\t' read -r rid status verdict name <<< "$info"
+  case "$status" in
+    scanned|released) ;;
+    *) die "$rid hasn't finished downloading and scanning (status: $status)" ;;
+  esac
+  case "$verdict" in
+    CLEAN|WARNING) ;;
+    *) [[ "$force" == --force ]] || die "$rid was $verdict; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
+  esac
+
+  mkdir -p "$DOWNLOAD_DIR"
+  local dest="$DOWNLOAD_DIR/$name" tmp="$DOWNLOAD_DIR/.incoming-$rid"
+  [[ -e "$dest" ]] && dest="$DOWNLOAD_DIR/$name [$rid]"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  echo "Copying to $dest…"
+  limactl copy --backend=rsync -r "$VM:/srv/quarantine/$rid/files/" "$tmp/" >/dev/null
+  mv "$tmp" "$dest"
+  # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.
+  find "$dest" -exec xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
+  guest mark-released "$rid" "$dest"
+  printf '\033[32mReleased:\033[0m %s\n' "$dest"
+}
+
+cmd_get() {
+  local src="" no_release=0 args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-release) no_release=1 ;;
+      --category|--sha256) args+=("$1" "${2:?$1 needs a value}"); shift ;;
+      --yes|--force) args+=("$1") ;;
+      -*) die "unknown option $1" ;;
+      *) src=$1 ;;
+    esac
+    shift
+  done
+  [[ -n "$src" ]] || die 'usage: safetorrent get "<magnet link>" | file.torrent'
+  ensure_vm
+
+  local tmp; tmp=$(mktemp -d)
+  if [[ "$src" == magnet:* ]]; then
+    printf '%s' "$src" > "$tmp/source.magnet"
+  elif [[ -f "$src" ]]; then
+    cp "$src" "$tmp/source.torrent"
+  else
+    rm -rf "$tmp"; die "not a magnet link or an existing .torrent file: $src"
+  fi
+  push "$tmp"/source.*
+  local source_name; source_name=$(basename "$tmp"/source.*)
+  rm -rf "$tmp"
+
+  guest get "$source_name" ${args[@]+"${args[@]}"}
+  local id info status verdict
+  id=$(guest last)
+  [[ -n "$id" ]] || exit 1
+  info=$(guest release-info "$id")
+  IFS=$'\t' read -r _ status verdict _ <<< "$info"
+  [[ "$status" == scanned ]] || exit 0
+  echo
+  if [[ "$verdict" == CLEAN && $no_release -eq 0 ]]; then
+    release "$id"
+  elif [[ "$verdict" == CLEAN || "$verdict" == WARNING ]]; then
+    echo "Kept in quarantine. When you're happy with the warnings above: safetorrent release $id"
+  else
+    warn "Kept in quarantine; NOT copied to your Mac. Delete it with: safetorrent purge $id"
+  fi
+}
+
+cmd_setup() {
+  [[ "$(uname -s)" == Darwin ]] || die "safetorrent's host side is written for macOS"
+  if ! command -v limactl >/dev/null; then
+    command -v brew >/dev/null || die "install Homebrew first: https://brew.sh"
+    bold "Installing Lima (the VM manager)…"
+    brew install lima
+  fi
+
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  if [[ ! -f "$CONF" ]]; then
+    cp "$ROOT/config.example" "$CONF"; chmod 600 "$CONF"
+    echo "Created $CONF (add your VirusTotal key there)."
+  fi
+
+  case "$(vm_status)" in
+    "") bold "Creating the VM (first run downloads Ubuntu + virus definitions, ~5 min)…"
+        limactl create --name="$VM" --tty=false "$ROOT/vm/safetorrent.yaml"
+        limactl start "$VM" ;;
+    Stopped) limactl start "$VM" ;;
+  esac
+
+  local bin=/opt/homebrew/bin
+  [[ -w "$bin" ]] || bin=/usr/local/bin
+  if [[ -w "$bin" ]]; then
+    ln -sf "$ROOT/safetorrent" "$bin/safetorrent"
+    echo "Installed the command: $bin/safetorrent"
+  else
+    warn "Couldn't add safetorrent to your PATH; run it as $ROOT/safetorrent"
+  fi
+  push
+  bold "Checking the VM…"
+  guest doctor
+  bold "Ready. Try: safetorrent get \"magnet:?xt=…\""
+}
+
+main() {
+  local cmd=${1:-help}
+  [[ $# -gt 0 ]] && shift
+  load_config
+  case "$cmd" in
+    get) cmd_get "$@" ;;
+    setup) cmd_setup ;;
+    release) [[ $# -ge 1 ]] || die "usage: safetorrent release <id> [--force]"
+             ensure_vm; release "$@" ;;
+    list|last) ensure_vm; guest "$cmd" ;;
+    report|resume|rescan|purge)
+      [[ $# -ge 1 ]] || die "usage: safetorrent $cmd <id>"
+      ensure_vm
+      if [[ "$cmd" == resume || "$cmd" == rescan ]]; then push; fi
+      guest "$cmd" "$1"
+      if [[ "$cmd" == resume || "$cmd" == rescan ]]; then
+        local info status verdict
+        info=$(guest release-info "$1"); IFS=$'\t' read -r _ status verdict _ <<< "$info"
+        if [[ "$status" == scanned && "$verdict" == CLEAN ]]; then echo; release "$1"; fi
+      fi ;;
+    vpn|update|doctor|health) ensure_vm; push; guest "$cmd" ;;
+    vpn-import) cmd_vpn_import "$@" ;;
+    stop-download|pause) ensure_vm; guest stop "${1:?usage: safetorrent $cmd <id>}" ;;
+    sync) ensure_vm; push; guest last >/dev/null ;;
+    gui) exec "$ROOT/gui/launch.sh" ;;
+    start) ensure_vm; echo "VM running." ;;
+    stop) if [[ $# -ge 1 ]]; then ensure_vm; guest stop "$1"; else limactl stop "$VM"; fi ;;
+    shell) ensure_vm; limactl shell --workdir / "$VM" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
