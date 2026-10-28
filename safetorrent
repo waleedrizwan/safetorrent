@@ -144,7 +144,7 @@ release() {
   local dest="$DOWNLOAD_DIR/$name" tmp="$DOWNLOAD_DIR/.incoming-$rid"
   [[ -e "$dest" ]] && dest="$DOWNLOAD_DIR/$name [$rid]"
   rm -rf "$tmp"; mkdir -p "$tmp"
-  echo "Copying to $dest…"
+  echo "Copying to ${dest}…"
   limactl copy --backend=rsync -r "$VM:/srv/quarantine/$rid/files/" "$tmp/" >/dev/null
   mv "$tmp" "$dest"
   # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.

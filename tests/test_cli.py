@@ -47,7 +47,9 @@ class Release(unittest.TestCase):
         self.log = self.tmp / "limactl.log"
         self.downloads = self.home / "Downloads" / "SafeTorrents"
         self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bin_dir}:{os.environ['PATH']}",
-                    "FAKE_LOG": str(self.log), "FAKE_VM_FILES": str(self.vm_files)}
+                    "FAKE_LOG": str(self.log), "FAKE_VM_FILES": str(self.vm_files),
+                    # Terminal's default. macOS's bash 3.2 reads "$var…" as one long name under UTF-8.
+                    "LC_ALL": "en_US.UTF-8"}
 
     def release(self, status, verdict, name="Show", *args):
         self.env["FAKE_RELEASE_INFO"] = "\t".join([RID, status, verdict, name])
