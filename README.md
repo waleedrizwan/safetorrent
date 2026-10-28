@@ -138,6 +138,42 @@ isn't passing traffic, download a fresh one.
 
 - Grow the VM disk: `limactl stop safetorrent && limactl edit safetorrent --disk 150 && limactl start safetorrent`
 - Run the tests: `python3 -m unittest discover -s tests` (CI runs them on macOS with Python 3.9 and 3.12, plus ruff, mypy and shellcheck)
+- Run the end-to-end tests against the real VM (see below): `python3 -m unittest discover -s e2e -v`
+
+## End-to-end tests
+
+`tests/` fakes the VM and the scanners. `e2e/` uses the real ones: your VM,
+aria2c, the firewall, the VPN, 7-Zip, ClamAV and VirusTotal. It needs a working
+`safetorrent setup` and a passing `safetorrent health`, and takes a minute or two.
+It runs the real `safetorrent` command with a throwaway HOME (a copy of your config,
+with `DOWNLOAD_DIR` pointed at a temp folder), so nothing lands in your Downloads, and
+it purges its test torrents from the VM afterwards. CI can't run it, since it needs the VM.
+
+- **Isolation:** no Mac folders mounted; the torrent user can't reach the Mac
+  (`host.lima.internal` or its home-network address) or the VM's gateway, while the
+  VM's normal user can, which shows the check really tests the firewall. With
+  the VPN on: peers see a Proton IP, and if the tunnel is taken down, the torrent
+  user's IPv4 and IPv6 traffic stops.
+- **Pipeline:** test torrents are built inside the VM and seeded over its loopback as a
+  web seed, so they download with no peers and no internet. The EICAR file and fake
+  program headers never exist on the Mac:
+
+  | Torrent | Expected |
+  |---|---|
+  | clean video, image and subtitles | CLEAN; released byte-for-byte with Gatekeeper's quarantine flag; the torrent user can't change it after download |
+  | EICAR test file | INFECTED, refused by `release` |
+  | EICAR inside a zip inside a zip | INFECTED, found inside the inner zip |
+  | Windows program header named `.mkv` | passes the name check, then SUSPICIOUS |
+  | password-protected zip | SUSPICIOUS |
+  | 7z that unpacks to 1.5 GB | SUSPICIOUS, never unpacked |
+  | `Film.mp4.exe` | REJECTED before download, nothing downloaded |
+
+- **Public torrents** (opt-in, ~850 MB): `SAFETORRENT_E2E_INTERNET=1 python3 -m unittest discover -s e2e -v`
+  also downloads the current Debian arm64 netinst ISO, checks it against Debian's SHA256SUMS,
+  and downloads Blender's open movie *Sintel* by magnet link (Creative Commons).
+
+Never use real malware for testing. The EICAR string is the standard harmless file that every
+virus scanner is built to detect.
 - Rebuild the app launcher (e.g. after moving the project): `gui/make-app.sh`
 - Uninstall: `limactl delete -f safetorrent && rm /opt/homebrew/bin/safetorrent && rm -rf ~/.config/safetorrent`
 
