@@ -82,6 +82,17 @@ class AutoRelease(ServerBase):
         self.tick([item()])
         self.assertEqual(self.released(), [ID])
 
+    def test_copy_again_passes_again(self):
+        self.request("POST", f"/api/items/{ID}/release", {"again": True})
+        self.release.assert_called_once_with(ID, False, True)
+
+    def test_release_command_flags(self):
+        mock.patch.stopall()  # the real release(), with the CLI mocked
+        with mock.patch.object(self.srv, "cli", return_value="") as cli, \
+                mock.patch.object(self.srv, "refresh_items"):
+            self.srv.release(ID, force=True, again=True)
+        cli.assert_called_once_with("release", ID, "--force", "--again")
+
     def test_vpn_failure_rechecks_health(self):
         self.srv.State.items = [item(status="downloading", verdict=None)]
         self.srv.refresh_items.side_effect = lambda: setattr(

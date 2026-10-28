@@ -18,7 +18,7 @@ case "$1" in
   list) echo Running ;;
   copy)
     src=${@: -2:1}; dst=${@: -1}
-    cp -R "$FAKE_VM_FILES/." "$dst" ;;
+    sleep "${FAKE_SLEEP:-0}"; cp -R "$FAKE_VM_FILES/." "$dst" ;;
   shell)
     while [[ "$1" != st-guest ]]; do shift; done; shift
     case "$1" in
@@ -51,8 +51,8 @@ class Release(unittest.TestCase):
                     # Terminal's default. macOS's bash 3.2 reads "$var…" as one long name under UTF-8.
                     "LC_ALL": "en_US.UTF-8"}
 
-    def release(self, status, verdict, name="Show", *args):
-        self.env["FAKE_RELEASE_INFO"] = "\t".join([RID, status, verdict, name])
+    def release(self, status, verdict, name="Show", *args, auto="auto"):
+        self.env["FAKE_RELEASE_INFO"] = "\t".join([RID, status, verdict, auto, name])
         return subprocess.run([str(ROOT / "safetorrent"), "release", RID, *args], env=self.env,
                               capture_output=True, text=True, timeout=30)
 
@@ -68,9 +68,9 @@ class Release(unittest.TestCase):
     def test_clean_is_copied_and_marked(self):
         res = self.release("scanned", "CLEAN")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual((self.downloads / "Show" / "Show" / "ep1.mkv").read_bytes()[:4], b"\x1a\x45\xdf\xa3")
+        self.assertEqual((self.downloads / "Show" / "ep1.mkv").read_bytes()[:4], b"\x1a\x45\xdf\xa3")
         self.assertTrue(any(f"mark-released {RID} {self.downloads / 'Show'}" in c for c in self.calls()))
-        self.assertFalse(any(p.name.startswith(".incoming") for p in self.downloads.iterdir()))
+        self.assertEqual([p.name for p in self.downloads.iterdir()], ["Show"])  # no staging folder or lock left
 
     def test_warning_is_allowed_when_asked(self):
         self.assertEqual(self.release("scanned", "WARNING").returncode, 0)
@@ -100,14 +100,74 @@ class Release(unittest.TestCase):
         (self.downloads / "Show" / "mine.txt").write_text("keep me")
         self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
         self.assertEqual((self.downloads / "Show" / "mine.txt").read_text(), "keep me")
-        self.assertTrue((self.downloads / f"Show [{RID}]" / "Show" / "ep1.mkv").exists())
+        self.assertTrue((self.downloads / f"Show [{RID}]" / "ep1.mkv").exists())
 
     def test_download_dir_from_config(self):
         conf = self.home / ".config" / "safetorrent"
         conf.mkdir(parents=True)
         (conf / "config").write_text('DOWNLOAD_DIR="~/Elsewhere"  # comment\n')
         self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
-        self.assertTrue((self.home / "Elsewhere" / "Show" / "Show" / "ep1.mkv").exists())
+        self.assertTrue((self.home / "Elsewhere" / "Show" / "ep1.mkv").exists())
+
+    def test_already_released_needs_again(self):
+        res = self.release("released", "CLEAN")
+        self.assertIn("already on your Mac", res.stderr)
+        self.assert_nothing_copied(res)
+        self.assertEqual(self.release("released", "CLEAN", "Show", "--again").returncode, 0)
+        self.assertTrue((self.downloads / "Show" / "ep1.mkv").exists())
+
+    def test_repeated_copies_get_numbered_names(self):
+        for _ in range(3):
+            self.assertEqual(self.release("released", "CLEAN", "Show", "--again").returncode, 0)
+        self.assertEqual(sorted(p.name for p in self.downloads.iterdir()), ["Show", f"Show [{RID} 2]", f"Show [{RID}]"])
+        for d in self.downloads.iterdir():
+            self.assertEqual([p.name for p in d.iterdir()], ["ep1.mkv"])  # nothing hidden inside
+
+    def test_single_file_torrent_is_released_as_the_file(self):
+        shutil.rmtree(self.vm_files / "Show")
+        (self.vm_files / "movie.mkv").write_bytes(b"\x1a\x45\xdf\xa3")
+        (self.downloads).mkdir(parents=True)
+        (self.downloads / "movie.mkv").write_text("mine")
+        self.assertEqual(self.release("scanned", "CLEAN", "movie.mkv").returncode, 0)
+        self.assertEqual((self.downloads / "movie.mkv").read_text(), "mine")
+        self.assertTrue((self.downloads / f"movie [{RID}].mkv").is_file())
+
+    def test_only_one_copy_at_a_time(self):
+        self.env["FAKE_SLEEP"] = "1"
+        self.env["FAKE_RELEASE_INFO"] = "\t".join([RID, "scanned", "CLEAN", "auto", "Show"])
+        procs = [subprocess.Popen([str(ROOT / "safetorrent"), "release", RID], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        results = [(p.wait(30), p.stderr.read()) for p in procs]
+        for p in procs:
+            p.stdout.close()
+            p.stderr.close()
+        self.assertEqual(sorted(rc for rc, _ in results), [0, 1], results)
+        self.assertTrue(any("already being copied" in err for _, err in results), results)
+        self.assertEqual([p.name for p in self.downloads.iterdir()], ["Show"])
+
+    def test_lock_left_by_a_killed_copy_is_taken_over(self):
+        lock = self.downloads / f".release-{RID}.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("999999")  # no such process
+        self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
+        self.assertFalse(lock.exists())
+
+    def test_config_comments_and_quotes(self):
+        conf = self.home / ".config" / "safetorrent"
+        conf.mkdir(parents=True)
+        (conf / "config").write_text("DOWNLOAD_DIR='~/My #1 Shows'   # where they go\n")
+        self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
+        self.assertTrue((self.home / "My #1 Shows" / "Show" / "ep1.mkv").exists())
+
+    def test_relative_download_dir_refused(self):
+        conf = self.home / ".config" / "safetorrent"
+        conf.mkdir(parents=True)
+        (conf / "config").write_text("DOWNLOAD_DIR=Downloads/Here\n")
+        res = subprocess.run([str(ROOT / "safetorrent"), "release", RID], env=dict(
+            self.env, FAKE_RELEASE_INFO="\t".join([RID, "scanned", "CLEAN", "auto", "Show"])),
+            cwd=self.tmp, capture_output=True, text=True, timeout=30)
+        self.assertIn("full path", res.stderr)
+        self.assertFalse((self.tmp / "Downloads").exists())
 
     @unittest.skipUnless(sys.platform == "darwin", "Gatekeeper's quarantine flag is macOS-only")
     def test_every_file_gets_gatekeeper_quarantine_flag(self):

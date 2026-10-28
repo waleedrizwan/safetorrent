@@ -24,14 +24,16 @@ safetorrent: quarantine, scan, then release torrents
       --no-release     keep it in quarantine even if it's clean
   safetorrent list                 everything in quarantine
   safetorrent report <id>          full scan report
-  safetorrent release <id> [--force]  copy to your Mac (--force for SUSPICIOUS/INFECTED)
+  safetorrent release <id> [--force] [--again]
+                                   copy to your Mac (--force for SUSPICIOUS/INFECTED,
+                                   --again if it's already been copied)
   safetorrent resume <id>          continue a stopped download
   safetorrent rescan <id>          scan again (e.g. after `update`)
   safetorrent purge <id>|all       delete from quarantine
   safetorrent vpn                  show VPN status and the IP peers see
   safetorrent vpn-import <file>    swap in a new Proton WireGuard file (rolls back if it fails)
   safetorrent health               the safety checks that must pass before downloading
-  safetorrent stop <id>            pause a background download
+  safetorrent stop <id>            pause a download (also: pause <id>)
   safetorrent gui                  open the web app
   safetorrent update               refresh virus definitions + VM security updates
   safetorrent doctor               check everything is installed
@@ -47,8 +49,15 @@ load_config() {
     local line
     line=$(grep -E '^[[:space:]]*(DOWNLOAD_DIR|USE_VPN)=' "$CONF" || true)
     while IFS='=' read -r key value; do
-      value="${value%%#*}"; value="${value%"${value##*[![:space:]]}"}"
-      value="${value%\"}"; value="${value#\"}"; value="${value/#\~/$HOME}"
+      # Same rule as the app and the VM: a quoted value runs to its closing quote;
+      # otherwise a comment starts at " #".
+      value="${value#"${value%%[![:space:]]*}"}"
+      case "$value" in
+        \"*) value=${value:1}; value=${value%%\"*} ;;
+        \'*) value=${value:1}; value=${value%%\'*} ;;
+        *) value="${value%% #*}"; value="${value%"${value##*[![:space:]]}"}" ;;
+      esac
+      value="${value/#\~/$HOME}"
       case "${key// /}" in
         DOWNLOAD_DIR) DOWNLOAD_DIR="$value" ;;
         USE_VPN) USE_VPN="$value" ;;
@@ -95,10 +104,12 @@ guest() {
 cmd_vpn_import() {
   local file=${1:?usage: safetorrent vpn-import <file.conf>}
   [[ -f "$file" ]] || die "no such file: $file"
-  grep -q '^\[Interface\]' "$file" && grep -q '^\[Peer\]' "$file" && grep -qi '^PrivateKey' "$file" \
-    && grep -qi '^Endpoint' "$file" || die "that isn't a WireGuard config (download the GNU/Linux one from Proton)"
+  if ! { grep -q '^\[Interface\]' "$file" && grep -q '^\[Peer\]' "$file" && grep -qi '^PrivateKey' "$file" \
+         && grep -qi '^Endpoint' "$file"; }; then
+    die "that isn't a WireGuard config (download the GNU/Linux one from Proton)"
+  fi
   mkdir -p "$CONF_DIR"
-  local backup=""
+  local backup="" previous_vpn=$USE_VPN
   if [[ -f "$CONF_DIR/wg0.conf" ]]; then backup="$CONF_DIR/wg0.conf.previous"; cp "$CONF_DIR/wg0.conf" "$backup"; fi
   install -m 600 "$file" "$CONF_DIR/wg0.conf"
   set_config USE_VPN yes
@@ -110,6 +121,7 @@ cmd_vpn_import() {
     printf '\033[32mNew VPN config is working.\033[0m\n'
   else
     if [[ -n "$backup" ]]; then mv "$backup" "$CONF_DIR/wg0.conf"; else rm -f "$CONF_DIR/wg0.conf"; fi
+    set_config USE_VPN "${previous_vpn:-no}"
     push; guest vpn >/dev/null 2>&1 || true
     die "Proton didn't accept that config, so the previous one was kept. Make sure you chose GNU/Linux and a P2P server."
   fi
@@ -127,37 +139,78 @@ set_config() {
   fi
 }
 
+# Only one copy of an item at a time (the terminal and the app can both release).
+# mkdir is atomic; a lock left by a killed copy is taken over.
+take_lock() {
+  local lock=$1 pid
+  if mkdir "$lock" 2>/dev/null; then echo $$ > "$lock/pid"; return 0; fi
+  pid=$(cat "$lock/pid" 2>/dev/null || true)
+  if [[ -n "$pid" ]]; then
+    kill -0 "$pid" 2>/dev/null && return 1
+  elif (( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || echo 0) < 30 )); then
+    return 1   # just taken; its pid isn't written yet
+  fi
+  rm -rf "$lock"
+  mkdir "$lock" 2>/dev/null || return 1
+  echo $$ > "$lock/pid"
+}
+
 release() {
-  local id=$1 force=${2:-} info rid status verdict name
+  local id=$1 force="" again="" info rid status verdict auto name
+  shift
+  for opt in "$@"; do
+    case "$opt" in
+      --force) force=1 ;;
+      --again) again=1 ;;
+      *) die "unknown option $opt" ;;
+    esac
+  done
   info=$(guest release-info "$id") || exit 1
-  IFS=$'\t' read -r rid status verdict name <<< "$info"
+  IFS=$'\t' read -r rid status verdict auto name <<< "$info"
   case "$status" in
-    scanned|released) ;;
+    scanned) ;;
+    released) [[ -n "$again" ]] || die "$rid is already on your Mac. To copy it again: safetorrent release $rid --again" ;;
     *) die "$rid hasn't finished downloading and scanning (status: $status)" ;;
   esac
   case "$verdict" in
     CLEAN|WARNING) ;;
-    *) [[ "$force" == --force ]] || die "$rid was $verdict; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
+    *) [[ -n "$force" ]] || die "$rid was $verdict; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
   esac
 
+  [[ "$DOWNLOAD_DIR" == /* ]] || die "DOWNLOAD_DIR must be a full path (like ~/Downloads/SafeTorrents), not: $DOWNLOAD_DIR"
   mkdir -p "$DOWNLOAD_DIR"
-  local dest="$DOWNLOAD_DIR/$name" tmp="$DOWNLOAD_DIR/.incoming-$rid"
-  [[ -e "$dest" ]] && dest="$DOWNLOAD_DIR/$name [$rid]"
-  rm -rf "$tmp"; mkdir -p "$tmp"
-  echo "Copying to ${dest}…"
+  local lock="$DOWNLOAD_DIR/.release-$rid.lock" tmp="$DOWNLOAD_DIR/.incoming-$rid"
+  take_lock "$lock" || die "$rid is already being copied to your Mac."
+  # shellcheck disable=SC2064  # expand now: the trap runs after these locals are gone
+  trap "rm -rf $(printf %q "$tmp") $(printf %q "$lock")" EXIT
+  rm -rf "$tmp"; mkdir "$tmp"
   limactl copy --backend=rsync -r "$VM:/srv/quarantine/$rid/files/" "$tmp/" >/dev/null
-  mv "$tmp" "$dest"
+
+  # files/ holds the torrent's one top-level folder (or its one file): release that
+  # itself rather than a folder of the same name around it.
+  local src=$tmp entries
+  entries=$(ls -A "$tmp")
+  if [[ -n "$entries" && "$entries" != *$'\n'* ]]; then src="$tmp/$entries"; fi
+  local stem=$name ext="" n=1 tag dest="$DOWNLOAD_DIR/$name"
+  if [[ -f "$src" && "$name" == ?*.* ]]; then stem=${name%.*}; ext=.${name##*.}; fi
+  while [[ -e "$dest" || -L "$dest" ]]; do
+    tag=$rid; (( n > 1 )) && tag="$rid $n"
+    dest="$DOWNLOAD_DIR/${stem} [${tag}]${ext}"; n=$((n + 1))
+  done
+  echo "Copying to ${dest}…"
+  mv "$src" "$dest"
   # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.
   find "$dest" -exec xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
   guest mark-released "$rid" "$dest"
+  rm -rf "$tmp" "$lock"; trap - EXIT
   printf '\033[32mReleased:\033[0m %s\n' "$dest"
 }
 
 cmd_get() {
-  local src="" no_release=0 args=()
+  local src="" args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --no-release) no_release=1 ;;
+      --no-release) args+=(--no-auto-release) ;;   # the VM records it, so the app won't copy it either
       --category|--sha256) args+=("$1" "${2:?$1 needs a value}"); shift ;;
       --yes|--force) args+=("$1") ;;
       -*) die "unknown option $1" ;;
@@ -181,14 +234,14 @@ cmd_get() {
   rm -rf "$tmp"
 
   guest get "$source_name" ${args[@]+"${args[@]}"}
-  local id info status verdict
+  local id info status verdict auto
   id=$(guest last)
   [[ -n "$id" ]] || exit 1
   info=$(guest release-info "$id")
-  IFS=$'\t' read -r _ status verdict _ <<< "$info"
+  IFS=$'\t' read -r _ status verdict auto _ <<< "$info"
   [[ "$status" == scanned ]] || exit 0
   echo
-  if [[ "$verdict" == CLEAN && $no_release -eq 0 ]]; then
+  if [[ "$verdict" == CLEAN && "$auto" == auto ]]; then
     release "$id"
   elif [[ "$verdict" == CLEAN || "$verdict" == WARNING ]]; then
     echo "Kept in quarantine. When you're happy with the warnings above: safetorrent release $id"
@@ -248,14 +301,14 @@ main() {
       if [[ "$cmd" == resume || "$cmd" == rescan ]]; then push; fi
       guest "$cmd" "$1"
       if [[ "$cmd" == resume || "$cmd" == rescan ]]; then
-        local info status verdict
-        info=$(guest release-info "$1"); IFS=$'\t' read -r _ status verdict _ <<< "$info"
-        if [[ "$status" == scanned && "$verdict" == CLEAN ]]; then echo; release "$1"; fi
+        local info status verdict auto
+        info=$(guest release-info "$1"); IFS=$'\t' read -r _ status verdict auto _ <<< "$info"
+        if [[ "$status" == scanned && "$verdict" == CLEAN && "$auto" == auto ]]; then echo; release "$1"; fi
       fi ;;
     vpn|update|doctor|health) ensure_vm; push; guest "$cmd" ;;
     vpn-import) cmd_vpn_import "$@" ;;
     stop-download|pause) ensure_vm; guest stop "${1:?usage: safetorrent $cmd <id>}" ;;
-    sync) ensure_vm; push; guest last >/dev/null ;;
+    sync) ensure_vm; push; guest last >/dev/null ;;   # used by the app: hand the VM the current config
     gui) exec "$ROOT/gui/launch.sh" ;;
     start) ensure_vm; echo "VM running." ;;
     stop) if [[ $# -ge 1 ]]; then ensure_vm; guest stop "$1"; else limactl stop "$VM"; fi ;;

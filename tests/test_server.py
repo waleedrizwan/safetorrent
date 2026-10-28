@@ -10,7 +10,6 @@ import shutil
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -125,6 +124,87 @@ class AccessControl(ServerBase):
         self.assertEqual(self.request("POST", "/api/items/../../etc/delete", {})[0], 404)
         self.assertEqual(self.request("POST", "/api/items/abc123/format-disk", {})[0], 400)
 
+    def test_malformed_requests_are_400_not_500(self):
+        cases = [
+            ("POST", "/api/add", b"[1, 2]"),                       # JSON, but not an object
+            ("POST", "/api/add", b'{"magnet": 5}'),                # wrong type
+            ("POST", "/api/add", b'{"torrent_b64": ["x"]}'),
+            ("POST", "/api/settings", b'{"download_dir": 7}'),
+            ("POST", "/api/vpn/import", b'{"conf_text": {"a": 1}}'),
+        ]
+        for method, path, raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.request(method, path, raw=raw)[0], 400)
+
+    def raw_post(self, length):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.putrequest("POST", "/api/add", skip_host=True)
+        conn.putheader("Host", f"127.0.0.1:{self.port}")
+        conn.putheader("X-Safetorrent-Token", self.token)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", length)
+        conn.endheaders()
+        status = conn.getresponse().status
+        conn.close()
+        return status
+
+    def test_bad_content_length(self):
+        # A negative length used to mean "read until the client hangs up", tying up a thread.
+        self.assertEqual(self.raw_post("-1"), 400)
+        self.assertEqual(self.raw_post("lots"), 400)
+
+    def test_non_ascii_token_is_refused_not_a_crash(self):
+        self.assertEqual(self.request("GET", "/api/state", token="tökén")[0], 403)
+
+
+class LaunchCodes(ServerBase):
+    """The launcher gets a one-time code for the page's URL instead of putting the
+    token on a command line, where any local user could read it with ps."""
+
+    def session(self, code):
+        return self.request("POST", "/api/session", {"code": code}, token=False)
+
+    def test_code_needs_the_token(self):
+        self.assertEqual(self.request("POST", "/api/launch-code", {}, token=False)[0], 403)
+
+    def test_code_is_traded_for_the_token_once(self):
+        code = self.request("POST", "/api/launch-code", {})[1]["code"]
+        status, data, _ = self.session(code)
+        self.assertEqual((status, data["token"]), (200, self.token))
+        status, data, _ = self.session(code)
+        self.assertEqual(status, 400)
+        self.assertNotIn("token", data)
+
+    def test_expired_and_made_up_codes(self):
+        code = self.request("POST", "/api/launch-code", {})[1]["code"]
+        with mock.patch.object(self.srv.time, "time", return_value=self.srv.time.time() + 3600):
+            self.assertEqual(self.session(code)[0], 400)
+        for bad in ("nope", "", 5, None):
+            self.assertEqual(self.session(bad)[0], 400, bad)
+
+    def test_session_still_checks_the_host(self):
+        code = self.request("POST", "/api/launch-code", {})[1]["code"]
+        self.assertEqual(self.request("POST", "/api/session", {"code": code}, token=False,
+                                      host=f"evil.example:{self.port}")[0], 403)
+
+    def test_launcher_never_passes_the_token_as_an_argument(self):
+        script = (ROOT / "gui" / "launch.sh").read_text()
+        self.assertNotIn("#t=", script)
+        self.assertIn("-H @-", script)  # the token header goes to curl on stdin
+
+
+class PageScript(ServerBase):
+    def test_script_is_a_file_and_inline_scripts_are_blocked(self):
+        status, body, res = self.request("GET", "/app.js", token=False)
+        self.assertEqual(status, 200)
+        self.assertIn("javascript", res.getheader("Content-Type"))
+        self.assertIn("async function api(", body)
+        csp = self.request("GET", "/", token=False)[2].getheader("Content-Security-Policy")
+        script_src = csp.split("script-src", 1)[1].split(";")[0]
+        self.assertEqual(script_src.strip(), "'self'")
+        page = (ROOT / "gui" / "index.html").read_text()
+        self.assertEqual(page.count("<script"), page.count('<script src="/app.js">'))
+
 
 class Settings(ServerBase):
     def conf(self) -> Path:
@@ -136,6 +216,11 @@ class Settings(ServerBase):
             ({"seed_minutes": -1}, "between 0"),
             ({"seed_minutes": "abc"}, "whole number"),
             ({"download_dir": "~/x\nUSE_VPN=no"}, "folder"),
+            ({"download_dir": "~/x\rUSE_VPN=no"}, "folder"),          # splitlines() breaks on these too
+            ({"download_dir": "~/x USE_VPN=no"}, "folder"),
+            ({"download_dir": "~/x\x1cUSE_VPN=no"}, "folder"),
+            ({"download_dir": "~/x\tY"}, "folder"),
+            ({"download_dir": "Downloads/Here"}, "full path"),
             ({"use_vpn": True}, "Import a WireGuard"),
         ]
         for body, msg in bad:
@@ -273,6 +358,7 @@ def hostile_state():
 class HostileNamesInBrowser(ServerBase):
     def test_torrent_names_render_as_text(self):
         self.srv.ROUTES[("GET", "/api/state")] = lambda _body: hostile_state()
+        code = self.request("POST", "/api/launch-code", {})[1]["code"]  # as the launcher does
         profile = tempfile.mkdtemp()
         # Chrome hangs on startup when HOME is the empty test home; only the server needs that one.
         env = dict(os.environ, HOME=pwd.getpwuid(os.getuid()).pw_dir)
@@ -280,7 +366,7 @@ class HostileNamesInBrowser(ServerBase):
             out = subprocess.run(
                 [CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
                  f"--user-data-dir={profile}", "--virtual-time-budget=6000", "--dump-dom",
-                 f"http://127.0.0.1:{self.port}/#t={self.token}"],
+                 f"http://127.0.0.1:{self.port}/#c={code}"],
                 capture_output=True, text=True, timeout=90, env=env).stdout
         finally:
             shutil.rmtree(profile, ignore_errors=True)
@@ -289,6 +375,7 @@ class HostileNamesInBrowser(ServerBase):
         self.assertNotIn("<title>PWNED</title>", out)              # never ran
         self.assertNotIn('<img src="x"', out)
         self.assertNotIn("<script>document.title", out)
+        self.assertNotIn(code, self.srv.LAUNCH_CODES)  # the page used it up
 
 
 if __name__ == "__main__":

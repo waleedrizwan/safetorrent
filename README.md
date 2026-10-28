@@ -59,7 +59,9 @@ What's enforced automatically:
 - **The firewall is verified on every check,** and rebuilt only if it's wrong.
 
 The app listens only on `127.0.0.1:8765`, and every request needs a secret token
-from `~/.config/safetorrent/gui-token`, so other websites can't control it.
+from `~/.config/safetorrent/gui-token`, so other websites can't control it. The
+launcher never puts that token on a command line: it opens the page with a one-time
+code that the page trades for the token.
 Logs are in `~/Library/Logs/safetorrent-gui.log`.
 
 ## Setup
@@ -104,17 +106,17 @@ isn't passing traffic, download a fresh one.
 
 | Command | What it does |
 |---|---|
-| `get <magnet or .torrent> [--category media\|software\|docs\|iso] [--sha256 H] [--yes] [--force] [--no-release]` | Full pipeline |
+| `get <magnet or .torrent> [--category media\|software\|docs\|iso] [--sha256 H] [--yes] [--force] [--no-release]` | Full pipeline (`--no-release` also stops the app from copying it) |
 | `list` | Everything in quarantine and its verdict |
 | `report <id>` | Full findings |
-| `release <id> [--force]` | Copy to the Mac (`--force` needed for SUSPICIOUS/INFECTED) |
+| `release <id> [--force] [--again]` | Copy to the Mac (`--force` needed for SUSPICIOUS/INFECTED, `--again` if it's already been copied) |
 | `resume <id>` | Continue a stopped download |
 | `rescan <id>` | Scan again, e.g. after `update` |
 | `purge <id>` / `purge all` | Delete from the VM |
 | `vpn` | VPN status and the IP that peers see |
 | `vpn-import <file.conf>` | Swap in a new Proton WireGuard file (tested first, rolled back if it fails) |
 | `health` | The safety checks; exits non-zero if downloads are blocked |
-| `stop <id>` | Pause a background download |
+| `stop <id>` / `pause <id>` | Pause a download, whether it's running in the app or in another terminal |
 | `gui` | Open the app |
 | `update` | New virus definitions and VM security updates (the VM also refreshes definitions on its own while running) |
 | `doctor` | Health check |
@@ -135,7 +137,7 @@ isn't passing traffic, download a fresh one.
 ## Housekeeping
 
 - Grow the VM disk: `limactl stop safetorrent && limactl edit safetorrent --disk 150 && limactl start safetorrent`
-- Run the tests: `python3 -m unittest discover -s tests`
+- Run the tests: `python3 -m unittest discover -s tests` (CI runs them on macOS with Python 3.9 and 3.12, plus ruff, mypy and shellcheck)
 - Rebuild the app launcher (e.g. after moving the project): `gui/make-app.sh`
 - Uninstall: `limactl delete -f safetorrent && rm /opt/homebrew/bin/safetorrent && rm -rf ~/.config/safetorrent`
 
@@ -146,5 +148,5 @@ isn't passing traffic, download a fresh one.
 - `vm/safetorrent.yaml`: Lima VM definition (isolation settings, packages).
 - `config.example`: template for `~/.config/safetorrent/config`.
 - `gui/server.py`: local web server for the app (Python standard library only).
-- `gui/index.html`: the app's interface.
+- `gui/index.html`, `gui/app.js`: the app's interface.
 - `gui/launch.sh`, `gui/make-app.sh`: start the app / build `SafeTorrent.app`.

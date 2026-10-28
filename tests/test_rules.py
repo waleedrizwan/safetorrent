@@ -132,6 +132,87 @@ class Sniff(unittest.TestCase):
     def test_script_as_image(self):
         self.assertEqual(st.max_level(st.sniff("cover.jpg", b"#!/bin/sh\ncurl evil")), st.DANGER)
 
+    def test_program_without_a_known_extension(self):
+        pe = b"MZ\x90\x00" + b"\0" * 60
+        for path in ("Movie/extras/data.bin2", "Movie/README", "Movie/x.terminal2"):
+            with self.subTest(path):
+                self.assertEqual(st.max_level(st.sniff(path, pe, "media")), st.DANGER)
+                self.assertEqual(st.max_level(st.sniff(path, pe, "docs")), st.DANGER)
+                # Extensionless programs are normal in software (e.g. Linux binaries).
+                self.assertEqual(st.sniff(path, pe, "software"), [])
+
+    def test_program_disguised_as_a_web_page_or_macro_doc(self):
+        for path in ("index.html", "report.docm"):
+            self.assertEqual(st.max_level(st.sniff(path, b"\x7fELF\x02\x01")), st.DANGER, path)
+
+
+class MacAndWindowsTricks(unittest.TestCase):
+    """File types that run code when opened on a Mac (or Windows) but weren't on the lists."""
+
+    def level(self, path, category="media"):
+        return st.max_level(st.check_names([("Movie.2160p.mkv", 4 * 1024**3), (path, 2000)], category, "Movie 2160p"))
+
+    def test_mac_executables_in_a_movie(self):
+        for ext in ("terminal", "dylib", "applescript", "prefPane", "scptd", "saver", "osax", "xpc", "bundle",
+                    "plugin", "fileloc", "action"):
+            with self.subTest(ext):
+                self.assertEqual(self.level(f"Movie/extra.{ext}"), st.DANGER)
+
+    def test_windows_extras(self):
+        for ext in ("msc", "chm", "application", "settingcontent-ms", "appref-ms"):
+            with self.subTest(ext):
+                self.assertEqual(self.level(f"Movie/extra.{ext}"), st.DANGER)
+
+    def test_terminal_files_are_dangerous_even_in_software(self):
+        self.assertEqual(self.level("Tool/run.terminal", "software"), st.DANGER)
+
+    def test_trailing_dots_and_spaces_dont_hide_the_extension(self):
+        for name in ("Movie/codec.exe.", "Movie/codec.exe ", "Movie/codec.exe. ."):
+            with self.subTest(repr(name)):
+                self.assertEqual(st.ext_of(name), "exe")
+                self.assertEqual(self.level(name), st.DANGER)
+        self.assertEqual(self.level("Movie/clip.mp4.exe."), st.DANGER)
+
+    def test_web_pages_in_a_movie_get_a_warning(self):
+        for ext in ("html", "htm", "svg", "mht"):
+            self.assertEqual(self.level(f"Movie/info.{ext}"), st.WARN, ext)
+        self.assertEqual(self.level("Docs/manual.html", "docs"), st.INFO)
+
+    def test_inetloc_is_junk(self):
+        self.assertEqual(self.level("Movie/site.inetloc"), st.INFO)
+
+
+class MalformedTorrents(unittest.TestCase):
+    """Odd structures get a clean "not a valid .torrent" error, never a traceback."""
+
+    def test_rejected_cleanly(self):
+        cases = {
+            "list as dict key": b"dli1ee1:xe",
+            "info is a number": b"d4:infoi1ee",
+            "file entry is a number": b"d4:infod5:filesli1ee6:pieces1:xee",
+            "length is text": bencode({"info": {"name": "a", "pieces": b"x" * 20, "length": "big"}}),
+            "files is a dict": bencode({"info": {"name": "a", "pieces": b"x" * 20, "files": {"a": 1}}}),
+            "path is a number": bencode({"info": {"name": "a", "pieces": b"x" * 20,
+                                                  "files": [{"length": 1, "path": 5}]}}),
+            "negative size": bencode({"info": {"name": "a", "pieces": b"x" * 20, "length": -5}}),
+        }
+        for label, blob in cases.items():
+            with self.subTest(label), self.assertRaisesRegex(ValueError, "not a valid .torrent"):
+                st.parse_torrent(blob)
+
+
+class ConfigValues(unittest.TestCase):
+    """The rule the CLI (bash), the app and the VM all follow."""
+
+    def test_rule(self):
+        for raw, want in [("~/Downloads/SafeTorrents", "~/Downloads/SafeTorrents"),
+                          ("  yes   # turn it on", "yes"),
+                          ('"~/My #1 Shows"  # quoted', "~/My #1 Shows"),
+                          ("'single quoted' # note", "single quoted"),
+                          ("a#b", "a#b"),
+                          ("", "")]:
+            self.assertEqual(st.config_value(raw), want, raw)
+
 
 if __name__ == "__main__":
     unittest.main()

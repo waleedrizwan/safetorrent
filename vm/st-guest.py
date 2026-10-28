@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 # Root owns QUARANTINE, STATE_DIR and each download's folder (meta.json, logs).
 # The torrent user may write only its home and each download's files/ and
@@ -75,13 +76,15 @@ MACRO_DOCS = set("docm dotm xlsm xltm xlam pptm potm ppsm doc xls ppt".split())
 ARCHIVES = set("zip rar 7z tar gz tgz bz2 tbz2 xz txz zst lz lzma cab arj".split())
 DISK_IMAGES = set("iso img bin".split())
 UNPACKABLE_IMAGES = set("iso img dmg".split())  # 7z opens these, so their contents get scanned
-ALWAYS_DANGER = set("lnk scr pif hta vbe jse wsf wsh cpl".split())
+ALWAYS_DANGER = set("lnk scr pif hta vbe jse wsf wsh cpl terminal settingcontent-ms appref-ms".split())
 EXEC = ALWAYS_DANGER | set(
-    "exe msi msp msix appx dll sys com bat cmd ps1 psm1 vbs js reg jar "  # Windows
-    "dmg pkg mpkg app command tool workflow scpt kext "  # macOS
+    "exe msi msp msix appx dll sys com bat cmd ps1 psm1 vbs js reg jar msc chm gadget application "  # Windows
+    "dmg pkg mpkg app command tool workflow scpt scptd applescript kext dylib bundle plugin prefpane "
+    "saver osax xpc action fileloc "  # macOS
     "sh bash zsh run appimage deb rpm so py pl rb desktop apk".split()  # Linux/other
 )
-JUNK = set("url website webloc".split())
+JUNK = set("url website webloc inetloc".split())
+WEB = set("html htm shtml xhtml mht mhtml svg".split())  # open in a browser, where they can run scripts
 MEDIA_KINDS = {"video", "audio", "image"}
 
 QUALITY_RE = re.compile(r"(?i)(2160p|1080p|720p|\b4k\b|uhd|blu-?ray|bdrip|web-?dl|webrip|remux)")
@@ -93,7 +96,7 @@ def ext_of(path: str) -> str:
     parts = path.replace("\\", "/").split("/")
     if any(p.lower().endswith(".app") for p in parts[:-1]):
         return "app"  # anything inside a macOS .app bundle
-    name = parts[-1]
+    name = parts[-1].rstrip(". ")  # Windows drops trailing dots and spaces: "x.exe." runs as x.exe
     if "." not in name.lstrip("."):
         return ""
     return name.rsplit(".", 1)[1].lower()
@@ -120,6 +123,8 @@ def kind_of(ext: str) -> str:
         return "disk"
     if ext in JUNK:
         return "junk"
+    if ext in WEB:
+        return "web"
     return "other"
 
 
@@ -154,7 +159,7 @@ def check_names(files: list[tuple[str, int]], category: str, torrent_name: str =
         base = path.replace("\\", "/").rsplit("/", 1)[-1]
         ext = ext_of(path)
         kind = kind_of(ext)
-        dots = base.lower().split(".")
+        dots = base.lower().rstrip(". ").split(".")
         if BIDI_RE.search(path):
             out.append(finding(DANGER, path, "contains hidden right-to-left characters used to fake a file's extension"))
         elif len(dots) >= 3 and dots[-1] in EXEC and kind_of(dots[-2]) not in ("exec", "other", "archive"):
@@ -175,6 +180,8 @@ def check_names(files: list[tuple[str, int]], category: str, torrent_name: str =
             out.append(finding(WARN, path, "archive inside a media torrent (unusual); it will be extracted and scanned"))
         elif kind == "disk" and category == "media":
             out.append(finding(WARN, path, "disk image inside a media torrent (unusual)"))
+        elif kind == "web" and category == "media":
+            out.append(finding(WARN, path, "web page inside a media torrent; it can run scripts when opened"))
         elif kind == "junk":
             out.append(finding(INFO, path, "web shortcut, usually an ad; ignore it"))
         if "password" in base.lower():
@@ -242,16 +249,21 @@ EXPECTED_MAGIC = {
 }
 
 
-def sniff(path: str, head: bytes) -> list[dict]:
+def sniff(path: str, head: bytes, category: str = "software") -> list[dict]:
     """Compare a file's real contents with what its extension claims."""
     if not head:
         return []
     ext = ext_of(path)
     kind = kind_of(ext)
-    if kind in ("video", "audio", "image", "doc", "sidecar"):
-        for magic, desc in EXEC_MAGIC:
-            if head.startswith(magic):
-                return [finding(DANGER, path, f"is really a {desc} disguised as .{ext}")]
+    program = next((desc for magic, desc in EXEC_MAGIC if head.startswith(magic)), None)
+    if program and kind in ("other", "junk") and category in ("media", "docs"):
+        # No extension, or one we don't know: in software, extensionless programs are
+        # normal; in a movie or a book they're not.
+        named = f"disguised as .{ext}" if ext else "with no file extension"
+        return [finding(DANGER, path, f"is really a {program} {named}")]
+    if kind in ("video", "audio", "image", "doc", "sidecar", "macro", "web"):
+        if program:
+            return [finding(DANGER, path, f"is really a {program} disguised as .{ext}")]
         if kind in MEDIA_KINDS and head.startswith(b"#!"):
             return [finding(DANGER, path, f"is really a script disguised as .{ext}")]
     check = EXPECTED_MAGIC.get(ext)
@@ -314,23 +326,28 @@ def parse_torrent(data: bytes) -> dict:
     dec = _Bdecoder(data)
     try:
         meta = dec.parse()
-    except (ValueError, IndexError) as e:
+    except (ValueError, IndexError, TypeError) as e:  # TypeError: a list used as a dict key
         raise ValueError(f"not a valid .torrent file ({e})") from None
-    if not isinstance(meta, dict) or dec.info_span is None:
+    if not isinstance(meta, dict) or not isinstance(meta.get(b"info"), dict) or dec.info_span is None:
         raise ValueError("not a valid .torrent file (no info section)")
     info = meta[b"info"]
     if b"pieces" not in info:
         raise ValueError("BitTorrent v2-only torrents aren't supported by the downloader")
-    name = _text(info.get(b"name.utf-8", info.get(b"name", b"unnamed")))
-    files: list[tuple[str, int]] = []
-    if b"files" in info:
-        for f in info[b"files"]:
-            if b"p" in f.get(b"attr", b"") or b"l" in f.get(b"attr", b""):
-                continue  # BEP 47 padding file or symlink: no data of its own
-            parts = f.get(b"path.utf-8", f.get(b"path", []))
-            files.append(("/".join([name] + [_text(p) for p in parts]), int(f[b"length"])))
-    else:
-        files.append((name, int(info[b"length"])))
+    try:
+        name = _text(info.get(b"name.utf-8", info.get(b"name", b"unnamed")))
+        files: list[tuple[str, int]] = []
+        if b"files" in info:
+            for f in info[b"files"]:
+                if b"p" in f.get(b"attr", b"") or b"l" in f.get(b"attr", b""):
+                    continue  # BEP 47 padding file or symlink: no data of its own
+                parts = f.get(b"path.utf-8", f.get(b"path", []))
+                files.append(("/".join([name] + [_text(p) for p in parts]), int(f[b"length"])))
+        else:
+            files.append((name, int(info[b"length"])))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ValueError("not a valid .torrent file (its file list is malformed)") from None
+    if any(size < 0 for _, size in files):
+        raise ValueError("not a valid .torrent file (negative file size)")
     start, end = dec.info_span
     return {
         "name": name,
@@ -394,12 +411,21 @@ class StError(Exception):
     """A problem to show the user; main() prints it as text or JSON."""
 
 
-def die(msg: str):
+def die(msg: str) -> NoReturn:
     raise StError(msg)
 
 
 def emit(obj) -> None:
     print(json.dumps(obj))
+
+
+def config_value(raw: str) -> str:
+    """The value in KEY=value. Same rule in the CLI, the app and the VM: a quoted
+    value runs to its closing quote; otherwise a comment starts at " #"."""
+    v = raw.strip()
+    if v[:1] in ("'", '"'):
+        return v[1:].split(v[0], 1)[0]
+    return v.split(" #", 1)[0].strip()
 
 
 def load_config() -> dict:
@@ -411,7 +437,7 @@ def load_config() -> dict:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            cfg[key.strip()] = value.split(" #", 1)[0].strip().strip("'\"")
+            cfg[key.strip()] = config_value(value)
     return cfg
 
 
@@ -436,9 +462,12 @@ def load_meta(d: Path) -> dict:
 
 
 def save_meta(d: Path, meta: dict) -> None:
-    tmp = d / "meta.json.tmp"
-    tmp.write_text(json.dumps(meta, indent=2))
-    tmp.replace(d / "meta.json")
+    # A unique temp name: a background job and a status refresh may save at the same moment.
+    fd, tmp = tempfile.mkstemp(prefix=".meta-", suffix=".tmp", dir=d)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, d / "meta.json")
 
 
 def walk_files(root: Path) -> list[tuple[str, int]]:
@@ -784,6 +813,7 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
         print(paint(f"\nDownloading into the VM's quarantine ({human(meta['total'])})…", "1"), flush=True)
     meta.update(status="downloading", phase="Connecting to peers")
     meta.pop("error", None)
+    claim(meta)
     save_meta(d, meta)
     log = d / "aria2.log"
     cmd = as_torrent_user([
@@ -849,7 +879,10 @@ def download_progress(d: Path) -> dict | None:
         fh.seek(max(0, log.stat().st_size - 8192))
         tail = fh.read().decode("utf-8", "replace")
     line = (re.findall(r"\[#\w+ [^\]]*\]", tail) or [""])[-1]
-    field = lambda name: (re.search(name + r":([\w.]+)", line) or [None, None])[1]
+
+    def field(name):
+        m = re.search(name + r":([\w.]+)", line)
+        return m.group(1) if m else None
     seeding = SEEDING_RE.match(line)
     if seeding:  # finished; aria2 prints only the share ratio while seeding
         return {"seeding": True, "ratio": seeding.group(1), "percent": 100, "peers": field("CN")}
@@ -879,6 +912,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
         if (m and int(m.group(1)) != 1) or re.search(r"\.(r\d\d|z\d\d)$", name) or (
                 re.search(r"\.\d{3}$", name) and not name.endswith(".001")):
             continue  # later volume of a multi-part archive
+        if not sevenz:
+            die("7-Zip isn't installed in the VM, so archives can't be checked; run `safetorrent setup`")
         src = root / rel
         dest = extracted_root / (rel + ".d") if depth == 0 else src.parent / (src.name + ".d")
         listing = run(as_torrent_user([sevenz, "l", "-slt", NOPASS, "--", str(src)]),
@@ -903,8 +938,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
         inner = walk_files(dest)
         inner_rel = [(str(Path(rel + ".d") / p), s) for p, s in inner]
         out += check_names(inner_rel, inner_category, inner=True)
-        for (p, _s), (prel, _) in zip(inner, inner_rel):
-            out += sniff(prel, read_head(dest / p))
+        for p, _s in inner:
+            out += sniff(str(Path(rel + ".d") / p), read_head(dest / p), inner_category)
         if depth < 2:
             nested = extract_archives(d, inner, dest, cfg, inner_category, depth + 1)
             for f in nested:
@@ -993,7 +1028,8 @@ def vt_lookup(sha: str, key: str) -> tuple[str, dict | None]:
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             stats = json.load(r)["data"]["attributes"]["last_analysis_stats"]
-            return "found", stats
+            # A file VT has only just received can come back without results yet.
+            return ("found", stats) if isinstance(stats, dict) else ("error", None)
     except urllib.error.HTTPError as e:
         return {404: "unknown", 401: "badkey", 403: "badkey", 429: "ratelimit"}.get(e.code, "error"), None
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
@@ -1054,6 +1090,7 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
             else:
                 unknown_other += 1
         else:
+            stats = stats or {}
             bad, sus = stats.get("malicious", 0), stats.get("suspicious", 0)
             engines = sum(stats.values())
             if bad >= 3:
@@ -1097,6 +1134,7 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     if not quiet:
         print(paint("\nScanning…", "1"), flush=True)
     meta["status"] = "scanning"
+    claim(meta)
     shutil.rmtree(d / "extracted", ignore_errors=True)
     run(["install", "-d", "-o", TORRENT_USER, "-g", TORRENT_USER, str(d / "extracted")])
     files = walk_files(d / "files")
@@ -1104,7 +1142,7 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     set_phase(d, meta, "Checking what each file really is")
     findings = check_names(files, category, meta["name"])
     for rel, _ in files:
-        findings += sniff(rel, read_head(d / "files" / rel))
+        findings += sniff(rel, read_head(d / "files" / rel), category)
     set_phase(d, meta, "Unpacking archives")
     findings += extract_archives(d, files, d / "files", cfg, category)
     set_phase(d, meta, "Virus scan (ClamAV)")
@@ -1121,7 +1159,10 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         findings += verify_checksum(d, meta["sha256"])
         trust_checksum(findings)
     level = max_level(findings)
-    meta.update(status="scanned", phase="", scan={"verdict": SCAN_VERDICT[level], "findings": findings, "at": now()})
+    # A rescan of something already copied keeps it "released": rescanning must not
+    # make it look new and get it copied again.
+    meta.update(status="released" if meta.get("released_to") else "scanned", phase="",
+                scan={"verdict": SCAN_VERDICT[level], "findings": findings, "at": now()})
     save_meta(d, meta)
     if not quiet:
         print_report(meta)
@@ -1198,6 +1239,32 @@ def unit_name(item_id: str) -> str:
     return f"st-{item_id}"
 
 
+BUSY = ("queued", "downloading", "scanning")
+
+
+def proc_start_time(pid: int) -> str | None:
+    """When a process started (ticks since boot), to tell it from a later one reusing its pid."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def claim(meta: dict) -> None:
+    """Record this process as the one working on the item. Downloads run from the
+    terminal aren't systemd units, so this is how other commands know they're alive."""
+    meta["worker"] = {"pid": os.getpid(), "start": proc_start_time(os.getpid())}
+
+
+def worker_alive(meta: dict) -> bool:
+    w = meta.get("worker") or {}
+    return w.get("start") is not None and proc_start_time(w.get("pid", 0)) == w["start"]
+
+
+def is_running(meta: dict, units: set[str]) -> bool:
+    return meta["id"] in units or (meta["status"] in BUSY and worker_alive(meta))
+
+
 def active_units() -> set[str]:
     res = run(["systemctl", "list-units", "--type=service", "--state=active,activating", "--plain",
                "--no-legend", "st-*"], capture_output=True, text=True)
@@ -1206,14 +1273,14 @@ def active_units() -> set[str]:
 
 def item_view(d: Path, running: set[str]) -> dict:
     meta = load_meta(d)
-    busy = meta["status"] in ("queued", "downloading", "scanning")
+    alive = is_running(meta, running)
     just_queued = meta["status"] == "queued" and time.time() - meta.get("queued_at", 0) < 15
-    if busy and meta["id"] not in running and not just_queued:
+    if meta["status"] in BUSY and not alive and not just_queued:
         # The background job died (e.g. the VM restarted): make the state honest.
         meta.update(status="downloaded" if meta["status"] == "scanning" else "incomplete", phase="",
                     error=meta.get("error") or "Interrupted (the VM may have restarted). Resume it to continue.")
         save_meta(d, meta)
-    meta["running"] = meta["id"] in running
+    meta["running"] = alive
     if meta["status"] == "downloading":
         meta["progress"] = download_progress(d)
     return meta
@@ -1226,7 +1293,7 @@ def cmd_get(args, cfg) -> int:
     health = enforce(cfg)
     vpn = next(c for c in health["checks"] if c["id"] == "vpn")
     print(("✓ " if vpn["state"] == "ok" else "⚠ ") + vpn["title"] + ": " + vpn["detail"])
-    meta, info, existed = precheck(inbox() / args.source, cfg, args.category, args.sha256, True)
+    meta, info, existed = precheck(inbox() / args.source, cfg, args.category, args.sha256, not args.no_auto_release)
     d = QUARANTINE / meta["id"]
     if existed:
         print(f"Already have this torrent (id {meta['id']}).")
@@ -1275,7 +1342,7 @@ def cmd_add(args, cfg) -> int:
 def cmd_start(args, cfg) -> int:
     d = item_dir(args.id)
     meta = load_meta(d)
-    if args.id in active_units() or meta["id"] in active_units():
+    if is_running(meta, active_units()):
         die("That download is already running.")
     if args.scan_only:
         sync_inbox()
@@ -1330,6 +1397,12 @@ def cmd_stop(args, cfg) -> int:
     d = item_dir(args.id)
     meta = load_meta(d)
     run(["systemctl", "stop", unit_name(meta["id"])], capture_output=True)
+    if meta["status"] in BUSY and worker_alive(meta):  # running from a terminal, not systemd
+        os.kill(meta["worker"]["pid"], signal.SIGTERM)  # it stops aria2 and saves its state
+        for _ in range(60):
+            if not worker_alive(meta):
+                break
+            time.sleep(0.5)
     meta = load_meta(d)
     # "incomplete" too: a status refresh can race us and mark it interrupted first.
     if meta["status"] in ("queued", "downloading", "incomplete"):
@@ -1341,9 +1414,21 @@ def cmd_stop(args, cfg) -> int:
     return 0
 
 
+def safe_item_view(d: Path, running: set[str]) -> dict:
+    """item_view, but one unreadable record shows as a broken item you can delete
+    instead of failing the whole list."""
+    try:
+        return item_view(d, running)
+    except (OSError, ValueError, KeyError) as e:
+        return {"id": d.name, "name": d.name, "status": "broken", "phase": "", "total": 0, "file_count": 0,
+                "files": [], "category": "", "added": "", "running": False,
+                "error": f"Its record couldn't be read ({e}). Delete it and add the torrent again.",
+                "precheck": {"verdict": "WARNING", "findings": []}}
+
+
 def cmd_items(args, cfg) -> int:
     running = active_units()
-    items = [item_view(m.parent, running) for m in QUARANTINE.glob("*/meta.json")]
+    items = [safe_item_view(m.parent, running) for m in QUARANTINE.glob("*/meta.json")]
     items.sort(key=lambda m: m["added"], reverse=True)
     emit({"items": items, "free": shutil.disk_usage(QUARANTINE).free})
     return 0
@@ -1372,8 +1457,8 @@ def cmd_resume(args, cfg) -> int:
     d = item_dir(args.id)
     meta = load_meta(d)
     (QUARANTINE / ".last").write_text(meta["id"])
-    if meta["id"] in active_units():
-        die("It's already running in the background (see the GUI, or `safetorrent stop`).")
+    if is_running(meta, active_units()):
+        die("It's already running (see the GUI, or `safetorrent stop`).")
     if meta["status"] in ("scanned", "released"):
         print("Already downloaded and scanned.")
         print_report(meta)
@@ -1392,6 +1477,8 @@ def cmd_rescan(args, cfg) -> int:
     d = item_dir(args.id)
     meta = load_meta(d)
     (QUARANTINE / ".last").write_text(meta["id"])
+    if is_running(meta, active_units()):
+        die("It's already running (see the GUI, or `safetorrent stop`).")
     if meta["status"] not in ("downloaded", "scanned", "released"):
         die(f"can't scan: download status is '{meta['status']}'")
     scan(d, meta, cfg)
@@ -1400,7 +1487,7 @@ def cmd_rescan(args, cfg) -> int:
 
 def cmd_list(args, cfg) -> int:
     running = active_units()
-    items = [item_view(m.parent, running) for m in QUARANTINE.glob("*/meta.json")]
+    items = [safe_item_view(m.parent, running) for m in QUARANTINE.glob("*/meta.json")]
     if not items:
         print("Quarantine is empty.")
         return 0
@@ -1433,7 +1520,8 @@ def safe_folder_name(name: str, fallback: str) -> str:
 def cmd_release_info(args, cfg) -> int:
     meta = load_meta(item_dir(args.id))
     verdict = (meta.get("scan") or {}).get("verdict", "-")
-    print("\t".join([meta["id"], meta["status"], verdict, safe_folder_name(meta["name"], meta["id"])]))
+    auto = "auto" if meta.get("auto_release", True) else "manual"
+    print("\t".join([meta["id"], meta["status"], verdict, auto, safe_folder_name(meta["name"], meta["id"])]))
     return 0
 
 
@@ -1487,9 +1575,14 @@ def cmd_update(args, cfg) -> int:
     if res.returncode not in (0, 1):
         print(paint("freshclam reported a problem; definitions may be stale", "33"))
     print("Installing security updates for the VM's tools…", flush=True)
-    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-    run(["apt-get", "update", "-qq"], env=env)
-    run(["apt-get", "upgrade", "-y", "-qq"], env=env)
+    # As its own systemd unit: if the Mac side times out or disconnects, apt keeps
+    # going instead of being killed halfway through an upgrade.
+    res = run(["systemd-run", "--unit=safetorrent-apt", "--wait", "--collect", "--quiet",
+               "--setenv=DEBIAN_FRONTEND=noninteractive", "/bin/sh", "-c",
+               "apt-get update -qq && apt-get upgrade -y -qq"], capture_output=True, text=True)
+    if res.returncode != 0:
+        detail = (res.stderr.strip().splitlines() or ["see `journalctl -u safetorrent-apt`"])[-1]
+        print(paint(f"Security updates didn't finish: {detail}", "33"))
     return cmd_health(args, cfg)
 
 
@@ -1541,7 +1634,12 @@ def secure_layout() -> None:
             run(["chown", "-R", "--no-dereference", "root:root", str(d / "files")])
 
 
+def _terminate(_sig, _frame):
+    raise KeyboardInterrupt
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _terminate)
     p = argparse.ArgumentParser(prog="st-guest")
     p.add_argument("--json", action="store_true", help="machine-readable output (for the GUI)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1550,11 +1648,10 @@ def main() -> int:
         g.add_argument("source")
         g.add_argument("--category", choices=["media", "software", "docs", "iso"])
         g.add_argument("--sha256")
+        g.add_argument("--no-auto-release", action="store_true")
         if name == "get":
             g.add_argument("--yes", action="store_true")
             g.add_argument("--force", action="store_true")
-        else:
-            g.add_argument("--no-auto-release", action="store_true")
     st = sub.add_parser("start")
     st.add_argument("id")
     st.add_argument("--force", action="store_true")

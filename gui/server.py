@@ -4,6 +4,8 @@
 Listens on 127.0.0.1 only. Every API request must carry the per-install token
 (from ~/.config/safetorrent/gui-token) in a custom header, and the Host header
 must be localhost, so other websites can't drive it (CSRF / DNS rebinding).
+The launcher never puts the token on a command line: it gets a one-time code
+for the page to trade for the token (/api/launch-code, /api/session).
 All the real work is done by the VM agent and the `safetorrent` CLI.
 """
 from __future__ import annotations
@@ -43,6 +45,15 @@ GUEST_SH = (
 
 class ApiError(Exception):
     pass
+
+
+def text_field(body: dict, key: str, default: str = "") -> str:
+    value = body.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ApiError("Bad request.")
+    return value
 
 
 # ---------------------------------------------------------------- VM + CLI plumbing
@@ -89,6 +100,15 @@ def push_inbox(path: Path) -> None:
 # ---------------------------------------------------------------- config file
 
 
+def config_value(raw: str) -> str:
+    """The value in KEY=value. Same rule in the CLI, the app and the VM: a quoted
+    value runs to its closing quote; otherwise a comment starts at " #"."""
+    v = raw.strip()
+    if v[:1] in ("'", '"'):
+        return v[1:].split(v[0], 1)[0]
+    return v.split(" #", 1)[0].strip()
+
+
 def read_config() -> dict:
     cfg = {}
     if CONF.exists():
@@ -96,7 +116,7 @@ def read_config() -> dict:
             s = line.strip()
             if s and not s.startswith("#") and "=" in s:
                 k, v = s.split("=", 1)
-                cfg[k.strip()] = v.split(" #", 1)[0].strip().strip("'\"")
+                cfg[k.strip()] = config_value(v)
     return cfg
 
 
@@ -179,10 +199,10 @@ def refresh_items() -> None:
             State.items_error = str(e)
 
 
-def release(item_id: str, force: bool = False) -> None:
+def release(item_id: str, force: bool = False, again: bool = False) -> None:
     set_busy(f"release:{item_id}", "Copying to your Mac")
     try:
-        cli("release", item_id, *(["--force"] if force else []))
+        cli("release", item_id, *(["--force"] if force else []), *(["--again"] if again else []))
         State.release_errors.pop(item_id, None)
     except Exception as e:
         State.release_errors[item_id] = str(e) if isinstance(e, ApiError) else f"Copy failed: {e}"
@@ -197,8 +217,10 @@ def ensure_vm_running() -> None:
     State.vm = status
     if status == "Stopped":
         set_busy("vm", "Starting the VM")
-        subprocess.run(["limactl", "start", VM], capture_output=True)
-        set_busy("vm", None)
+        try:
+            subprocess.run(["limactl", "start", VM], capture_output=True)
+        finally:
+            set_busy("vm", None)
         State.vm = vm_status()
         if State.vm == "Running":
             try:
@@ -279,14 +301,14 @@ def api_add(body) -> dict:
     if State.health and State.health.get("blocked"):
         raise ApiError("Downloads are blocked until the safety checks pass.")
     # Validate before creating the staging folder so a rejected request leaves nothing behind.
-    if body.get("magnet"):
-        magnet = body["magnet"].strip()
+    if text_field(body, "magnet"):
+        magnet = text_field(body, "magnet").strip()
         if not magnet.startswith("magnet:?"):
             raise ApiError("That isn't a magnet link. It should start with magnet:?")
         suffix, data = ".magnet", magnet.encode()
-    elif body.get("torrent_b64"):
+    elif text_field(body, "torrent_b64"):
         try:
-            suffix, data = ".torrent", base64.b64decode(body["torrent_b64"], validate=True)
+            suffix, data = ".torrent", base64.b64decode(text_field(body, "torrent_b64"), validate=True)
         except ValueError:
             raise ApiError("That .torrent file couldn't be read.") from None
     else:
@@ -297,8 +319,8 @@ def api_add(body) -> dict:
     args = ["add", path.name]
     if body.get("category") in ("media", "software", "docs", "iso"):
         args += ["--category", body["category"]]
-    if body.get("sha256"):
-        args += ["--sha256", body["sha256"].strip()]
+    if text_field(body, "sha256").strip():
+        args += ["--sha256", text_field(body, "sha256").strip()]
     if body.get("auto_release") is False:
         args.append("--no-auto-release")
     set_busy("add", "Reading the torrent's file list")
@@ -331,7 +353,7 @@ def item_action(item_id: str, action: str, body) -> dict:
         State.auto_released.discard(item_id)
     elif action == "release":
         State.auto_released.add(item_id)
-        release(item_id, bool(body.get("force")))
+        release(item_id, bool(body.get("force")), bool(body.get("again")))
     elif action == "reveal":
         item = next((m for m in State.items if m["id"] == item_id), None)
         target = item and item.get("released_to")
@@ -348,7 +370,7 @@ def item_action(item_id: str, action: str, body) -> dict:
 def api_settings(body) -> dict:
     updates = {}
     if "vt_key" in body and body["vt_key"] is not None:
-        key = body["vt_key"].strip()
+        key = text_field(body, "vt_key").strip()
         if key and not re.fullmatch(r"[0-9a-fA-F]{64}", key):
             raise ApiError("A VirusTotal API key is 64 letters and numbers (0-9, a-f).")
         updates["VT_API_KEY"] = key
@@ -357,9 +379,13 @@ def api_settings(body) -> dict:
             raise ApiError("Import a WireGuard file from Proton first.")
         updates["USE_VPN"] = "yes" if body["use_vpn"] else "no"
     if "download_dir" in body:
-        d = body["download_dir"].strip()
-        if not d or "\n" in d:
+        d = text_field(body, "download_dir").strip()
+        # One line, no control characters: the value goes into a line-based config file
+        # (and Python's splitlines() also breaks on \r, \x1c-\x1e, \x85, \u2028...).
+        if not d or d.splitlines() != [d] or any(ord(c) < 32 or ord(c) == 127 for c in d):
             raise ApiError("Choose a folder for finished downloads.")
+        if not (d.startswith("/") or d == "~" or d.startswith("~/")):
+            raise ApiError("Use a full path for the downloads folder, like ~/Downloads/SafeTorrents.")
         updates["DOWNLOAD_DIR"] = d
     if "seed_minutes" in body:
         try:
@@ -377,7 +403,7 @@ def api_settings(body) -> dict:
 
 
 def api_vpn_import(body) -> dict:
-    text = body.get("conf_text", "")
+    text = text_field(body, "conf_text")
     if len(text) > 20000 or not all(s in text for s in ("[Interface]", "[Peer]", "PrivateKey", "Endpoint")):
         raise ApiError("That isn't a WireGuard config. On Proton's WireGuard page choose GNU/Linux and a P2P server.")
     fd, tmp = tempfile.mkstemp(suffix=".conf")
@@ -395,7 +421,8 @@ def api_vpn_import(body) -> dict:
 
 
 def api_update(_body) -> dict:
-    background("update", "Updating virus definitions", cli, "update")
+    # apt runs as its own unit in the VM, so even this timeout can't cut an upgrade short.
+    background("update", "Updating virus definitions", lambda: cli("update", timeout=3600))
     return {"ok": True}
 
 
@@ -406,7 +433,10 @@ def api_refresh(_body) -> dict:
 
 
 def api_vm_start(_body) -> dict:
-    threading.Thread(target=lambda: (ensure_vm_running(), refresh_health()), daemon=True).start()
+    def start():
+        ensure_vm_running()
+        refresh_health()
+    threading.Thread(target=start, daemon=True).start()
     return {"ok": True}
 
 
@@ -427,6 +457,31 @@ def api_quit(body) -> dict:
     return {"ok": True}
 
 
+LAUNCH_CODES: dict = {}   # one-time code -> expiry time
+LAUNCH_CODE_TTL = 120
+
+
+def api_launch_code(_body) -> dict:
+    """For the launcher: a short-lived, single-use code to put in the page's URL."""
+    code = secrets.token_urlsafe(16)
+    with State.lock:
+        now = time.time()
+        for c in [c for c, expiry in LAUNCH_CODES.items() if expiry < now]:
+            del LAUNCH_CODES[c]
+        LAUNCH_CODES[code] = now + LAUNCH_CODE_TTL
+    return {"code": code}
+
+
+def api_session(body) -> dict:
+    """For the page: trade a launch code for the token. Needs no token itself."""
+    code = text_field(body, "code")
+    with State.lock:
+        expiry = LAUNCH_CODES.pop(code, 0)
+    if expiry < time.time():
+        raise ApiError("That link has already been used or has expired. Open SafeTorrent from its app icon.")
+    return {"token": TOKEN}
+
+
 ROUTES = {
     ("GET", "/api/state"): api_state,
     ("POST", "/api/refresh"): api_refresh,
@@ -437,7 +492,12 @@ ROUTES = {
     ("POST", "/api/vm/start"): api_vm_start,
     ("POST", "/api/open-downloads"): api_open_downloads,
     ("POST", "/api/quit"): api_quit,
+    ("POST", "/api/launch-code"): api_launch_code,
+    ("POST", "/api/session"): api_session,
 }
+PUBLIC_API = {"/api/session"}
+STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"),
+          "/app.js": ("app.js", "text/javascript; charset=utf-8")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -455,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-                         "font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; "
+                         "font-src https://fonts.gstatic.com; script-src 'self'; "
                          "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
@@ -463,26 +523,32 @@ class Handler(BaseHTTPRequestHandler):
     def json(self, code: int, obj) -> None:
         self.send(code, json.dumps(obj).encode(), "application/json")
 
-    def allowed(self) -> bool:
+    def allowed(self, path: str) -> bool:
         host = self.headers.get("Host", "")
         if host not in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
             return False
-        if self.path.startswith("/api/"):
+        if path.startswith("/api/") and path not in PUBLIC_API:
             given = self.headers.get("X-Safetorrent-Token", "")
-            return hmac.compare_digest(given, TOKEN)
+            return hmac.compare_digest(given.encode("utf-8", "replace"), TOKEN.encode())
         return True
 
     def handle_any(self, method: str) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/ping":
             return self.send(200, b"safetorrent", "text/plain")
-        if not self.allowed():
+        if not self.allowed(path):
             return self.json(403, {"error": "Not allowed. Open SafeTorrent from its app icon."})
-        if method == "GET" and path in ("/", "/index.html"):
-            return self.send(200, (ROOT / "gui" / "index.html").read_bytes(), "text/html; charset=utf-8")
+        if method == "GET" and path in STATIC:
+            name, ctype = STATIC[path]
+            return self.send(200, (ROOT / "gui" / name).read_bytes(), ctype)
         body = {}
         if method == "POST":
-            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0:
+                return self.json(400, {"error": "Bad request."})
             if length > MAX_BODY:
                 return self.json(413, {"error": "That file is too large to be a .torrent."})
             if not self.headers.get("Content-Type", "").startswith("application/json"):
@@ -490,6 +556,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
             except ValueError:
+                return self.json(400, {"error": "Bad request."})
+            if not isinstance(body, dict):
                 return self.json(400, {"error": "Bad request."})
         try:
             m = re.fullmatch(r"/api/items/([0-9a-f]+)/([\w-]+)", path)

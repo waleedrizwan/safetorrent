@@ -5,10 +5,8 @@ ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 APP="$HOME/Applications/SafeTorrent.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cat > "$APP/Contents/MacOS/SafeTorrent" <<SH
-#!/bin/bash
-exec "$ROOT/gui/launch.sh"
-SH
+# %q-quote the path: the project folder may contain spaces, quotes or $.
+printf '#!/bin/bash\nexec %q\n' "$ROOT/gui/launch.sh" > "$APP/Contents/MacOS/SafeTorrent"
 chmod +x "$APP/Contents/MacOS/SafeTorrent"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
