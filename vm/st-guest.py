@@ -16,6 +16,8 @@ Pipeline for one torrent:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -23,17 +25,25 @@ import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Root owns QUARANTINE, STATE_DIR and each download's folder (meta.json, logs).
+# The torrent user may write only its home and each download's files/ and
+# extracted/, so a compromised aria2/7z/ClamAV can't forge a verdict or make
+# root write through a planted symlink.
 QUARANTINE = Path("/srv/quarantine")
 STATE_DIR = Path("/var/lib/safetorrent")
+TORRENT_HOME = STATE_DIR / "torrent"
 CONFIG_DIR = Path("/etc/safetorrent")
+SCAN_LOCK = Path("/run/safetorrent-scan.lock")
 CLAMAV_DB = Path("/var/lib/clamav")
 TORRENT_USER = "torrent"
 DHT_BOOTSTRAP = "router.bittorrent.com:6881"
@@ -64,6 +74,7 @@ DOCS = set("pdf epub mobi azw azw3 djvu cbz cbr fb2 docx xlsx pptx odt ods odp r
 MACRO_DOCS = set("docm dotm xlsm xltm xlam pptm potm ppsm doc xls ppt".split())
 ARCHIVES = set("zip rar 7z tar gz tgz bz2 tbz2 xz txz zst lz lzma cab arj".split())
 DISK_IMAGES = set("iso img bin".split())
+UNPACKABLE_IMAGES = set("iso img dmg".split())  # 7z opens these, so their contents get scanned
 ALWAYS_DANGER = set("lnk scr pif hta vbe jse wsf wsh cpl".split())
 EXEC = ALWAYS_DANGER | set(
     "exe msi msp msix appx dll sys com bat cmd ps1 psm1 vbs js reg jar "  # Windows
@@ -130,8 +141,8 @@ def detect_category(files: list[tuple[str, int]]) -> str:
 # ---------------------------------------------------------------- name rules
 
 
-def finding(level: int, path: str, msg: str) -> dict:
-    return {"level": level, "path": path, "msg": msg}
+def finding(level: int, path: str, msg: str, **extra) -> dict:
+    return {"level": level, "path": path, "msg": msg, **extra}
 
 
 def check_names(files: list[tuple[str, int]], category: str, torrent_name: str = "",
@@ -441,14 +452,23 @@ def walk_files(root: Path) -> list[tuple[str, int]]:
     return sorted(out)
 
 
+def open_nofollow(path: Path):
+    """Open a file the torrent user can write to, refusing symlinks, FIFOs and devices."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"not a regular file: {path}")
+    return os.fdopen(fd, "rb")
+
+
 def read_head(path: Path, n: int = 1024) -> bytes:
-    with open(path, "rb") as fh:
+    with open_nofollow(path) as fh:
         return fh.read(n)
 
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as fh:
+    with open_nofollow(path) as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -722,23 +742,27 @@ def obtain_torrent(src: Path, cfg: dict) -> bytes:
     magnet = src.read_text().strip()
     if not magnet.startswith("magnet:?") or "xt=urn:btih:" not in magnet.lower():
         die("that doesn't look like a BitTorrent magnet link (needs xt=urn:btih:)")
-    tmp = STATE_DIR / "metadata"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir()
-    shutil.chown(tmp, TORRENT_USER, TORRENT_USER)
-    print("Fetching the torrent's file list from peers (nothing is downloaded yet)…", flush=True)
-    timeout = cfg["METADATA_TIMEOUT_SECONDS"]
-    run(as_torrent_user([
-        "timeout", timeout, "aria2c", "--bt-metadata-only=true", "--bt-save-metadata=true",
-        f"--dir={tmp}", "--enable-dht=true", f"--dht-file-path={STATE_DIR / 'dht.dat'}",
-        f"--dht-entry-point={DHT_BOOTSTRAP}", "--bt-enable-lpd=false",
-        "--console-log-level=error", "--summary-interval=0", "--quiet=true", magnet,
-    ]))
-    found = sorted(tmp.glob("*.torrent"))
-    if not found:
-        die(f"couldn't get the torrent's file list within {timeout}s. The torrent may be dead "
-            "(no peers); try again later or use a .torrent file.")
-    return found[0].read_bytes()
+    # A fresh folder per fetch, so two at once can't clobber each other. STATE_DIR
+    # is root-owned, so the torrent user can't swap it for a symlink before the chown.
+    tmp = Path(tempfile.mkdtemp(prefix="metadata-", dir=STATE_DIR))
+    try:
+        shutil.chown(tmp, TORRENT_USER, TORRENT_USER)
+        print("Fetching the torrent's file list from peers (nothing is downloaded yet)…", flush=True)
+        timeout = cfg["METADATA_TIMEOUT_SECONDS"]
+        run(as_torrent_user([
+            "timeout", timeout, "aria2c", "--bt-metadata-only=true", "--bt-save-metadata=true",
+            f"--dir={tmp}", "--enable-dht=true", f"--dht-file-path={TORRENT_HOME / 'dht.dat'}",
+            f"--dht-entry-point={DHT_BOOTSTRAP}", "--bt-enable-lpd=false",
+            "--console-log-level=error", "--summary-interval=0", "--quiet=true", magnet,
+        ]))
+        found = sorted(tmp.glob("*.torrent"))
+        if not found:
+            die(f"couldn't get the torrent's file list within {timeout}s. The torrent may be dead "
+                "(no peers); try again later or use a .torrent file.")
+        with open_nofollow(found[0]) as fh:
+            return fh.read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def set_phase(d: Path, meta: dict, phase: str) -> None:
@@ -753,6 +777,8 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
     revived, the download is stopped (the kill switch already blocks traffic).
     """
     files_dir = d / "files"
+    # A finished download is root-owned (see below); aria2 needs it back to resume or re-check it.
+    run(["chown", "-R", "--no-dereference", f"{TORRENT_USER}:{TORRENT_USER}", str(files_dir)])
     resuming = bool(walk_files(files_dir))
     if not background:
         print(paint(f"\nDownloading into the VM's quarantine ({human(meta['total'])})…", "1"), flush=True)
@@ -764,7 +790,7 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
         "aria2c", f"--dir={files_dir}", f"--seed-time={cfg['SEED_MINUTES']}",
         f"--bt-stop-timeout={int(cfg['STALL_TIMEOUT_MINUTES']) * 60}",
         "--file-allocation=none", f"--check-integrity={str(resuming).lower()}", "--bt-enable-lpd=false",
-        "--enable-dht=true", f"--dht-file-path={STATE_DIR / 'dht.dat'}",
+        "--enable-dht=true", f"--dht-file-path={TORRENT_HOME / 'dht.dat'}",
         f"--dht-entry-point={DHT_BOOTSTRAP}", "--auto-file-renaming=false",
         "--allow-overwrite=true", "--console-log-level=warn",
         f"--summary-interval={2 if background else 0}",
@@ -795,6 +821,9 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
             stop(signal.SIGKILL)
     if out:
         out.close()
+    if ok:
+        # Finished: nothing running as the torrent user may change what gets scanned and released.
+        run(["chown", "-R", "--no-dereference", "root:root", str(files_dir)])
     run(["chmod", "-R", "a+rX", str(files_dir)])
     if ok:
         meta.update(status="downloaded", phase="")
@@ -841,8 +870,11 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
     max_bytes = int(cfg["MAX_EXTRACT_GB"]) * 1024**3
     for rel, size in files:
         name = rel.lower()
-        if kind_of(ext_of(rel)) != "archive":
+        ext = ext_of(rel)
+        if kind_of(ext) != "archive" and ext not in UNPACKABLE_IMAGES:
             continue
+        # Programs are expected inside an OS image, as in a software torrent.
+        inner_category = "software" if category == "iso" and ext in UNPACKABLE_IMAGES else category
         m = re.search(r"\.part(\d+)\.rar$", name)
         if (m and int(m.group(1)) != 1) or re.search(r"\.(r\d\d|z\d\d)$", name) or (
                 re.search(r"\.\d{3}$", name) and not name.endswith(".001")):
@@ -870,18 +902,47 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
                 out.append(finding(WARN, rel, "archive couldn't be fully extracted (damaged or unsupported); only partly scanned"))
         inner = walk_files(dest)
         inner_rel = [(str(Path(rel + ".d") / p), s) for p, s in inner]
-        out += check_names(inner_rel, category, inner=True)
+        out += check_names(inner_rel, inner_category, inner=True)
         for (p, _s), (prel, _) in zip(inner, inner_rel):
             out += sniff(prel, read_head(dest / p))
         if depth < 2:
-            nested = extract_archives(d, inner, dest, cfg, category, depth + 1)
+            nested = extract_archives(d, inner, dest, cfg, inner_category, depth + 1)
             for f in nested:
                 f["path"] = str(Path(rel + ".d") / f["path"])
             out += nested
     return out
 
 
-def clamav_scan(d: Path) -> list[dict]:
+@contextlib.contextmanager
+def scan_lock(on_wait=None):
+    """One ClamAV at a time: each loads ~1.5 GB of signatures and the VM has 3 GB,
+    so two at once can get one killed for memory."""
+    with open(SCAN_LOCK, "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if on_wait:
+                on_wait()
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def too_big_for_clamav(d: Path, skipped: list[str]) -> list[dict]:
+    """Findings for files ClamAV skipped because of its size limits."""
+    out: list[dict] = []
+    media = 0
+    for rel in skipped:
+        if kind_of(ext_of(rel)) in MEDIA_KINDS:
+            media += 1  # big videos are normal; sniff() already checked they really are media
+        elif not (d / "extracted" / (rel + ".d")).is_dir():  # unpacked: ClamAV scanned what's inside
+            out.append(finding(WARN, rel, "too large for ClamAV to scan; only VirusTotal (if set up) checked it",
+                               unscanned=True))
+    if media:
+        out.append(finding(INFO, "", f"{media} media file(s) too large for ClamAV; checked to be real media"))
+    return out
+
+
+def clamav_scan(d: Path, on_wait=None) -> list[dict]:
     daily = sorted(CLAMAV_DB.glob("daily.c[lv]d"))
     if not daily:
         die("the virus database hasn't downloaded yet; run `safetorrent update` and try again")
@@ -892,19 +953,38 @@ def clamav_scan(d: Path) -> list[dict]:
     if sys.stdout.isatty():
         print("Scanning with ClamAV (loading signatures takes ~30s)…", flush=True)
     targets = [str(p) for p in (d / "files", d / "extracted") if p.exists()]
-    res = run(as_torrent_user([
+    cmd = as_torrent_user([
         "clamscan", "-r", "-i", "--no-summary", "--stdout", "--scan-archive=yes",
-        "--max-filesize=500M", "--max-scansize=2000M", "--alert-encrypted=no", *targets,
-    ]), capture_output=True, text=True, errors="replace")
+        "--max-filesize=500M", "--max-scansize=2000M", "--alert-exceeds-max=yes", "--alert-encrypted=no",
+        *targets,
+    ])
+    with scan_lock(on_wait):
+        res = run(cmd, capture_output=True, text=True, errors="replace")
+    skipped: list[str] = []
+    detected = False
     for line in res.stdout.splitlines():
         m = re.match(r"^(.*): (.+) FOUND$", line)
         if m:
             rel = os.path.relpath(m.group(1), d)
             rel = rel.split("/", 1)[1] if "/" in rel else rel  # drop files/ or extracted/
-            out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(2)}"))
-    if res.returncode == 2 and not out:
-        out.append(finding(WARN, "", "ClamAV reported an error; scan may be incomplete: "
-                           + (res.stderr.strip().splitlines() or ["unknown"])[-1]))
+            if m.group(2).startswith("Heuristics.Limits.Exceeded"):
+                skipped.append(rel)
+            else:
+                detected = True
+                out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(2)}"))
+    out += too_big_for_clamav(d, skipped)
+    # 0 = clean, 1 = detections. ClamAV counts a size-limit alert as an error (2), so
+    # 2 is fine only when every error was one of those. Anything else (a crash, an
+    # out-of-memory kill, a missing binary) means the scan didn't happen: fail closed.
+    errors = [ln for ln in res.stderr.splitlines() if ln.strip() and "LibClamAV Warning" not in ln]
+    finished = (res.returncode == 0 or (res.returncode == 1 and (detected or skipped))
+                or (res.returncode == 2 and skipped and not errors))
+    if not finished:
+        # With -i, a file ClamAV can't read gives exit code 2 and no output at all.
+        why = (errors or [ln for ln in res.stdout.splitlines() if not ln.endswith(" FOUND")]
+               or ["no details; often a file it couldn't read"])[-1]
+        out.append(finding(DANGER, "", f"ClamAV didn't finish (exit code {res.returncode}: {why}); "
+                                       "the virus scan is incomplete"))
     return out
 
 
@@ -998,8 +1078,17 @@ def verify_checksum(d: Path, expected: str) -> list[dict]:
     files = sorted(walk_files(d / "files"), key=lambda f: -f[1])
     for rel, _ in files:
         if sha256_file(d / "files" / rel) == expected:
-            return [finding(INFO, rel, "matches the publisher's SHA-256 checksum ✓")]
+            return [finding(INFO, rel, "matches the publisher's SHA-256 checksum ✓", verified=True)]
     return [finding(DANGER, "", "no file matches the SHA-256 checksum you provided; the download may be tampered with")]
+
+
+def trust_checksum(findings: list[dict]) -> None:
+    """A file that matches the publisher's checksum is the publisher's file, so ClamAV
+    skipping it (or files inside it) for size isn't a reason to hold it back."""
+    for v in [f["path"] for f in findings if f.get("verified")]:
+        for f in findings:
+            if f.get("unscanned") and (f["path"] == v or f["path"].startswith(v + ".d/")):
+                f.update(level=INFO, msg=f["msg"] + "; matches the publisher's checksum")
 
 
 
@@ -1019,12 +1108,18 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     set_phase(d, meta, "Unpacking archives")
     findings += extract_archives(d, files, d / "files", cfg, category)
     set_phase(d, meta, "Virus scan (ClamAV)")
-    findings += clamav_scan(d)
+
+    def wait_for_other_scan():
+        set_phase(d, meta, "Waiting for another virus scan to finish")
+        if not quiet:
+            print("Waiting for another virus scan to finish…", flush=True)
+    findings += clamav_scan(d, on_wait=wait_for_other_scan)
     set_phase(d, meta, "VirusTotal lookups")
     findings += virustotal(d, cfg, category, (lambda msg: set_phase(d, meta, msg)) if quiet else None)
     if meta.get("sha256"):
         set_phase(d, meta, "Checking the publisher's checksum")
         findings += verify_checksum(d, meta["sha256"])
+        trust_checksum(findings)
     level = max_level(findings)
     meta.update(status="scanned", phase="", scan={"verdict": SCAN_VERDICT[level], "findings": findings, "at": now()})
     save_meta(d, meta)
@@ -1074,8 +1169,7 @@ def precheck(src: Path, cfg: dict, category: str | None, sha256: str | None,
     category = category or detect_category(info["files"])
     findings = check_names(info["files"], category, info["name"])
     level = max_level(findings)
-    d.mkdir(exist_ok=True)
-    shutil.chown(d, TORRENT_USER, TORRENT_USER)
+    d.mkdir(mode=0o755, exist_ok=True)  # root's: only files/ is the torrent user's
     (d / "source.torrent").write_bytes(data)
     run(["install", "-d", "-o", TORRENT_USER, "-g", TORRENT_USER, str(d / "files")])
     biggest = sorted(info["files"], key=lambda f: -f[1])
@@ -1399,6 +1493,54 @@ def cmd_update(args, cfg) -> int:
     return cmd_health(args, cfg)
 
 
+def _remove(p: Path) -> None:
+    if p.is_symlink() or not p.is_dir():
+        p.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(p)
+
+
+def secure_layout() -> None:
+    """VMs set up before this version gave the torrent user QUARANTINE, STATE_DIR and
+    every download's folder. Take them back for root. Parents first, so the torrent
+    user can no longer swap entries while the rest is fixed."""
+    if (all(p.lstat().st_uid == 0 for p in (QUARANTINE, STATE_DIR))
+            and TORRENT_HOME.is_dir() and not TORRENT_HOME.is_symlink()):
+        return
+    for p in (QUARANTINE, STATE_DIR):
+        os.lchown(p, 0, 0)
+        os.chmod(p, 0o755)
+    # Caches root trusted but the torrent user could have written: start them afresh.
+    for p in [STATE_DIR / n for n in ("vpn-state.json", "vt-state.json", "dht.dat", "metadata")] + list(
+            STATE_DIR.glob("metadata-*")):
+        if p.is_symlink() or p.exists():
+            _remove(p)
+    if TORRENT_HOME.is_symlink() or (TORRENT_HOME.exists() and not TORRENT_HOME.is_dir()):
+        _remove(TORRENT_HOME)
+    TORRENT_HOME.mkdir(mode=0o700, exist_ok=True)
+    os.lchown(TORRENT_HOME, pwd.getpwnam(TORRENT_USER).pw_uid, pwd.getpwnam(TORRENT_USER).pw_gid)
+    run(["usermod", "-d", str(TORRENT_HOME), TORRENT_USER], capture_output=True)
+    for d in QUARANTINE.iterdir():
+        if d.is_symlink():
+            d.unlink()
+            continue
+        os.lchown(d, 0, 0)
+        if not d.is_dir():
+            continue  # .last
+        os.chmod(d, 0o755)
+        for entry in d.iterdir():
+            if entry.is_symlink():
+                entry.unlink()
+            elif entry.name not in ("files", "extracted"):
+                os.lchown(entry, 0, 0)
+        try:
+            finished = load_meta(d)["status"] in ("downloaded", "scanned", "released")
+        except (OSError, ValueError, KeyError):
+            finished = False
+        if finished and (d / "files").is_dir():
+            run(["chown", "-R", "--no-dereference", "root:root", str(d / "files")])
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="st-guest")
     p.add_argument("--json", action="store_true", help="machine-readable output (for the GUI)")
@@ -1438,6 +1580,7 @@ def main() -> int:
     try:
         if os.geteuid() != 0:
             die("must run as root inside the VM")
+        secure_layout()
         return handlers[args.cmd](args, load_config())
     except StError as e:
         if args.json:

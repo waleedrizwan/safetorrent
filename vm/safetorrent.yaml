@@ -39,9 +39,12 @@ provision:
     apt-get install -y --no-install-recommends \
       aria2 clamav clamav-freshclam 7zip 7zip-rar file python3 \
       wireguard-tools iptables curl ca-certificates
-    id torrent >/dev/null 2>&1 || useradd --system --home-dir /var/lib/safetorrent \
-      --create-home --shell /usr/sbin/nologin torrent
-    install -d -m 755 -o torrent -g torrent /var/lib/safetorrent /srv/quarantine
+    # Root owns the state and quarantine folders; the torrent user gets only its
+    # home here and, per download, the files/ and extracted/ folders.
+    install -d -m 755 /var/lib/safetorrent /srv/quarantine
+    id torrent >/dev/null 2>&1 || useradd --system --home-dir /var/lib/safetorrent/torrent \
+      --no-create-home --shell /usr/sbin/nologin torrent
+    install -d -m 700 -o torrent -g torrent /var/lib/safetorrent/torrent
     install -d -m 700 /etc/safetorrent /opt/safetorrent
     systemctl enable --now clamav-freshclam
     touch /var/lib/safetorrent/.provisioned

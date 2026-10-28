@@ -18,9 +18,11 @@ safetorrent get "magnet:?xt=urn:btih:…"
    the tunnel is up.
 3. **Scan.**
    - Checks each file's real contents against its extension (catches a program renamed to `.mp4`).
-   - Extracts archives, up to 3 levels deep, and checks what's inside.
+   - Extracts archives and disk images (`.iso`, `.img`, `.dmg`), up to 3 levels deep, and checks what's inside.
    - Flags password-protected archives and zip bombs.
-   - Runs ClamAV over everything.
+   - Runs ClamAV over everything, one scan at a time. If ClamAV doesn't finish, the result is
+     SUSPICIOUS, never CLEAN. Files too big for ClamAV (over 500 MB) give a warning unless
+     they're real media, were unpacked and scanned inside, or match your `--sha256`.
    - Looks up programs, archives and documents on VirusTotal.
    - With `--sha256`, verifies the download against the publisher's checksum.
 4. **Release.** A CLEAN result is copied to `~/Downloads/SafeTorrents`, with
