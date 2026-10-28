@@ -39,18 +39,22 @@ def load_server(home: str, port: int):
 class ServerBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.real_home = os.environ.get("HOME")
+        # Restores HOME, SAFETORRENT_PORT and the PATH the server prepends to, even if HOME was unset.
+        cls.env = mock.patch.dict(os.environ)
+        cls.env.start()
         cls.home = tempfile.mkdtemp()
         cls.port = free_port()
         cls.srv = load_server(cls.home, cls.port)
         cls.token = cls.srv.TOKEN
         cls.httpd = cls.srv.ThreadingHTTPServer(("127.0.0.1", cls.port), cls.srv.Handler)
+        cls.httpd.daemon_threads = True
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
-        os.environ["HOME"] = cls.real_home
+        cls.httpd.server_close()
+        cls.env.stop()
         shutil.rmtree(cls.home, ignore_errors=True)
 
     def setUp(self):
@@ -160,7 +164,8 @@ class Settings(ServerBase):
 
 class VpnImport(ServerBase):
     def test_rejects_non_wireguard(self):
-        for text in ("hello", "[Interface]\nPrivateKey = x\n", "x" * 30000):
+        oversized = "[Interface]\nPrivateKey = a\n[Peer]\nEndpoint = 1.2.3.4:1\n# " + "x" * 30000
+        for text in ("hello", "[Interface]\nPrivateKey = x\n", oversized):
             status, data, _ = self.request("POST", "/api/vpn/import", {"conf_text": text})
             self.assertEqual(status, 400)
         self.cli.assert_not_called()
@@ -205,6 +210,12 @@ class AddTorrent(ServerBase):
             status, _, _ = self.request("POST", "/api/add", {"magnet": text})
             self.assertEqual(status, 400, text)
         self.push.assert_not_called()
+
+    def test_rejected_add_leaves_no_temp_folder(self):
+        with mock.patch.object(self.srv.tempfile, "mkdtemp", wraps=tempfile.mkdtemp) as mkdtemp:
+            for body in ({"magnet": "javascript:alert(1)"}, {}, {"torrent_b64": "not base64!"}):
+                self.assertEqual(self.request("POST", "/api/add", body)[0], 400, body)
+        mkdtemp.assert_not_called()
 
     def test_auto_start_only_when_check_passes(self):
         magnet = "magnet:?xt=urn:btih:" + "a" * 40

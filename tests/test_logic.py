@@ -2,6 +2,7 @@
 VirusTotal verdicts, stale-state recovery, folder names. Run anywhere."""
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -200,10 +201,10 @@ class Verdicts(unittest.TestCase):
 
 
 class StaleState(unittest.TestCase):
-    def make(self, tmp, **meta):
-        d = Path(tmp) / "abcdef0123"
+    def make(self, tmp, item_id="abcdef0123", **meta):
+        d = Path(tmp) / item_id
         d.mkdir()
-        base = {"id": "abcdef0123", "status": "downloading", "precheck": {"verdict": "OK", "findings": []}}
+        base = {"id": item_id, "status": "downloading", "precheck": {"verdict": "OK", "findings": []}}
         (d / "meta.json").write_text(json.dumps({**base, **meta}))
         return d
 
@@ -226,15 +227,8 @@ class StaleState(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             m = st.item_view(self.make(tmp, status="queued", queued_at=time.time()), running=set())
             self.assertEqual(m["status"], "queued")
-            m = st.item_view(self.make_old(tmp), running=set())
+            m = st.item_view(self.make(tmp, item_id="abcdef0124", status="queued", queued_at=0), running=set())
             self.assertEqual(m["status"], "incomplete")
-
-    def make_old(self, tmp):
-        d = Path(tmp) / "abcdef0124"
-        d.mkdir()
-        (d / "meta.json").write_text(json.dumps({"id": "abcdef0124", "status": "queued", "queued_at": 0,
-                                                 "precheck": {"verdict": "OK", "findings": []}}))
-        return d
 
 
 class FolderNames(unittest.TestCase):
@@ -257,6 +251,7 @@ class FolderNames(unittest.TestCase):
 class HealthChecks(unittest.TestCase):
     def db(self, age_days):
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         if age_days is not None:
             p = Path(tmp) / "daily.cld"
             p.write_text("x")

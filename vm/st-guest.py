@@ -259,6 +259,8 @@ class _Bdecoder:
         self.info_span: tuple[int, int] | None = None
 
     def parse(self, depth: int = 0):
+        if depth > 64:
+            raise ValueError("nested too deeply")
         c = self.d[self.i:self.i + 1]
         if c == b"i":
             end = self.d.index(b"e", self.i)
@@ -312,8 +314,8 @@ def parse_torrent(data: bytes) -> dict:
     files: list[tuple[str, int]] = []
     if b"files" in info:
         for f in info[b"files"]:
-            if b"p" in f.get(b"attr", b""):
-                continue  # BEP 47 padding file
+            if b"p" in f.get(b"attr", b"") or b"l" in f.get(b"attr", b""):
+                continue  # BEP 47 padding file or symlink: no data of its own
             parts = f.get(b"path.utf-8", f.get(b"path", []))
             files.append(("/".join([name] + [_text(p) for p in parts]), int(f[b"length"])))
     else:

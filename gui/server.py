@@ -278,19 +278,22 @@ def api_state(_body) -> dict:
 def api_add(body) -> dict:
     if State.health and State.health.get("blocked"):
         raise ApiError("Downloads are blocked until the safety checks pass.")
-    stage = Path(tempfile.mkdtemp())
-    name = "src-" + secrets.token_hex(6)
+    # Validate before creating the staging folder so a rejected request leaves nothing behind.
     if body.get("magnet"):
         magnet = body["magnet"].strip()
         if not magnet.startswith("magnet:?"):
             raise ApiError("That isn't a magnet link. It should start with magnet:?")
-        path = stage / (name + ".magnet")
-        path.write_text(magnet)
+        suffix, data = ".magnet", magnet.encode()
     elif body.get("torrent_b64"):
-        path = stage / (name + ".torrent")
-        path.write_bytes(base64.b64decode(body["torrent_b64"]))
+        try:
+            suffix, data = ".torrent", base64.b64decode(body["torrent_b64"], validate=True)
+        except ValueError:
+            raise ApiError("That .torrent file couldn't be read.") from None
     else:
         raise ApiError("Paste a magnet link or choose a .torrent file.")
+    stage = Path(tempfile.mkdtemp())
+    path = stage / ("src-" + secrets.token_hex(6) + suffix)
+    path.write_bytes(data)
     args = ["add", path.name]
     if body.get("category") in ("media", "software", "docs", "iso"):
         args += ["--category", body["category"]]
@@ -489,7 +492,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self.json(400, {"error": "Bad request."})
         try:
-            m = re.fullmatch(r"/api/items/([0-9a-f]+)/(\w+)", path)
+            m = re.fullmatch(r"/api/items/([0-9a-f]+)/([\w-]+)", path)
             if method == "POST" and m:
                 return self.json(200, item_action(m.group(1), m.group(2), body))
             handler = ROUTES.get((method, path))
