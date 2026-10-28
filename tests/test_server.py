@@ -5,6 +5,7 @@ import http.client
 import importlib.util
 import json
 import os
+import pwd
 import shutil
 import socket
 import stat
@@ -273,12 +274,14 @@ class HostileNamesInBrowser(ServerBase):
     def test_torrent_names_render_as_text(self):
         self.srv.ROUTES[("GET", "/api/state")] = lambda _body: hostile_state()
         profile = tempfile.mkdtemp()
+        # Chrome hangs on startup when HOME is the empty test home; only the server needs that one.
+        env = dict(os.environ, HOME=pwd.getpwuid(os.getuid()).pw_dir)
         try:
             out = subprocess.run(
                 [CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
                  f"--user-data-dir={profile}", "--virtual-time-budget=6000", "--dump-dom",
                  f"http://127.0.0.1:{self.port}/#t={self.token}"],
-                capture_output=True, text=True, timeout=90).stdout
+                capture_output=True, text=True, timeout=90, env=env).stdout
         finally:
             shutil.rmtree(profile, ignore_errors=True)
         self.assertIn('class="item-name"', out, "page didn't render the downloads list")
