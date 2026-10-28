@@ -164,6 +164,13 @@ class VirusTotalVerdicts(unittest.TestCase):
         f, _ = self.scan({"app/data.zip": b"PK5"}, {})
         self.assertEqual(st.max_level(f), st.INFO)
 
+    def test_only_never_seen_is_marked_unvouched(self):
+        # trust_checksum may waive "nobody has seen it", never "an engine flagged it".
+        f, _ = self.scan({"app/new.exe": b"MZ6", "app/bad.exe": b"MZ7"},
+                         {"bad.exe": ("found", {"malicious": 1, "undetected": 69})})
+        self.assertEqual({x["path"]: bool(x.get("unvouched")) for x in f if x["level"] >= st.WARN},
+                         {"app/new.exe": True, "app/bad.exe": False})
+
     def test_media_is_not_looked_up(self):
         _, lookups = self.scan({"m/movie.mkv": b"\x1a\x45\xdf\xa3", "m/movie.srt": b"1"}, {})
         self.assertEqual(lookups, [])

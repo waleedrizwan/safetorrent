@@ -184,7 +184,9 @@ def check_names(files: list[tuple[str, int]], category: str, torrent_name: str =
             out.append(finding(WARN, path, "web page inside a media torrent; it can run scripts when opened"))
         elif kind == "junk":
             out.append(finding(INFO, path, "web shortcut, usually an ad; ignore it"))
-        if "password" in base.lower():
+        # The trick is a PASSWORD.txt (or a password-named archive) beside a locked archive;
+        # program files such as GRUB's password.mod are just named after what they do.
+        if "password" in base.lower() and kind in ("archive", "sidecar", "junk"):
             out.append(finding(WARN, path, "mentions a password; password-protected archives can't be virus-scanned"))
     if programs:
         out.append(finding(INFO, "", f"{len(programs)} program file(s), expected for software; each will be scanned"))
@@ -1086,7 +1088,8 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
             out.append(finding(WARN, rel, "VirusTotal lookup failed (network or rate limit)"))
         elif status == "unknown":
             if kind == "exec":
-                out.append(finding(WARN, rel, "program never seen by VirusTotal: new or rare, so no second opinion"))
+                out.append(finding(WARN, rel, "program never seen by VirusTotal: new or rare, so no second opinion",
+                                   unvouched=True))
             else:
                 unknown_other += 1
         else:
@@ -1121,10 +1124,11 @@ def verify_checksum(d: Path, expected: str) -> list[dict]:
 
 def trust_checksum(findings: list[dict]) -> None:
     """A file that matches the publisher's checksum is the publisher's file, so ClamAV
-    skipping it (or files inside it) for size isn't a reason to hold it back."""
+    skipping it (or files inside it) for size, or VirusTotal never having seen a program
+    inside it, isn't a reason to hold it back. Detections and other warnings still count."""
     for v in [f["path"] for f in findings if f.get("verified")]:
         for f in findings:
-            if f.get("unscanned") and (f["path"] == v or f["path"].startswith(v + ".d/")):
+            if (f.get("unscanned") or f.get("unvouched")) and (f["path"] == v or f["path"].startswith(v + ".d/")):
                 f.update(level=INFO, msg=f["msg"] + "; matches the publisher's checksum")
 
 

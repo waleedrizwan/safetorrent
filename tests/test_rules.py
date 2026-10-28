@@ -105,6 +105,16 @@ class NameRules(unittest.TestCase):
         f = st.check_names([("M/m.rar", 900 * MB), ("M/password.txt", 50)], "media", "M")
         self.assertEqual(st.max_level(f), st.WARN)
 
+    def test_password_hints_but_not_programs_named_after_passwords(self):
+        for path in ("S/PASSWORD.txt", "S/password.nfo", "S/Password is 1234.url", "S/password.rar"):
+            with self.subTest(path=path):
+                f = st.check_names([(path, 50), ("S/setup.exe", MB)], "software")
+                self.assertIn("mentions a password", " ".join(x["msg"] for x in f))
+        # GRUB modules inside a Linux ISO (found by the end-to-end Debian test).
+        inner = [("os.iso.d/boot/grub/arm64-efi/password.mod", 9000),
+                 ("os.iso.d/boot/grub/arm64-efi/password_pbkdf2.mod", 9000)]
+        self.assertEqual(st.max_level(st.check_names(inner, "software", inner=True)), st.INFO)
+
     def test_macro_doc(self):
         self.assertEqual(st.max_level(st.check_names([("b/report.docm", MB)], "docs")), st.WARN)
 

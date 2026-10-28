@@ -248,6 +248,17 @@ class TrustChecksum(unittest.TestCase):
         st.trust_checksum(findings)
         self.assertEqual([f["level"] for f in findings], [st.INFO, st.INFO, st.INFO, st.WARN, st.WARN, st.WARN])
 
+    def test_programs_virustotal_never_saw_inside_the_verified_file(self):
+        def unvouched(p):
+            return st.finding(st.WARN, p, "program never seen by VirusTotal", unvouched=True)
+        findings = [st.finding(st.INFO, "os.iso", "matches ✓", verified=True),
+                    unvouched("os.iso.d/EFI/boot/bootaa64.efi"), unvouched("extra/setup.exe"),
+                    st.finding(st.DANGER, "os.iso.d/EFI/boot/grubaa64.efi", "flagged by 1/70 engines"),
+                    st.finding(st.INFECTED, "os.iso.d/tool.exe", "ClamAV detected Win.Trojan.Agent")]
+        st.trust_checksum(findings)
+        self.assertEqual([f["level"] for f in findings], [st.INFO, st.INFO, st.WARN, st.DANGER, st.INFECTED])
+        self.assertEqual(st.SCAN_VERDICT[st.max_level(findings[:2])], "CLEAN")
+
     def test_no_match_trusts_nothing(self):
         findings = [st.finding(st.WARN, "os.iso", "too large", unscanned=True)]
         st.trust_checksum(findings)
