@@ -183,6 +183,21 @@ class ReleaseState(Base):
             st.scan(d, st.load_meta(d), {}, quiet=True)
         return st.load_meta(d)["status"]
 
+    def test_extracted_is_locked_before_clamav(self):
+        """7z runs as the torrent user, so what it unpacked must be taken away from it before ClamAV reads it."""
+        d = self.make(status="downloaded", category="media")
+        calls = []
+        with mock.patch.multiple(st, run=mock.Mock(side_effect=lambda cmd, **kw: calls.append(cmd)),
+                                 walk_files=mock.Mock(return_value=[]),
+                                 extract_archives=mock.Mock(side_effect=lambda *a, **kw: calls.append("7z") or []),
+                                 clamav_scan=mock.Mock(side_effect=lambda *a, **kw: calls.append("clamav") or []),
+                                 virustotal=mock.Mock(return_value=[])):
+            st.scan(d, st.load_meta(d), {}, quiet=True)
+        extracted = str(d / "extracted")
+        lock = [["chown", "-R", "--no-dereference", "root:root", extracted], ["chmod", "-R", "a+rX,go-w", extracted]]
+        i = calls.index("7z")
+        self.assertEqual(calls[i + 1:i + 4], lock + ["clamav"])
+
     def test_rescanning_something_already_copied_keeps_it_released(self):
         # Otherwise a rescan makes it look new, and the app or CLI copies it again.
         self.assertEqual(self.scan(released_to="/Users/me/Downloads/SafeTorrents/Show"), "released")

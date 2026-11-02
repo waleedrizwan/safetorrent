@@ -16,6 +16,7 @@ Pipeline for one torrent:
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import fcntl
 import hashlib
@@ -989,37 +990,61 @@ def clamav_scan(d: Path, on_wait=None) -> list[dict]:
         out.append(finding(WARN, "", f"virus definitions are {age_days:.0f} days old; run `safetorrent update`"))
     if sys.stdout.isatty():
         print("Scanning with ClamAV (loading signatures takes ~30s)…", flush=True)
-    targets = [str(p) for p in (d / "files", d / "extracted") if p.exists()]
+    roots = [p for p in (d / "files", d / "extracted") if p.exists()]
+    # No -i: ClamAV prints a line for every file it looked at, so every file can be
+    # accounted for. A file it couldn't open just goes missing from the output.
     cmd = as_torrent_user([
-        "clamscan", "-r", "-i", "--no-summary", "--stdout", "--scan-archive=yes",
+        "clamscan", "-r", "--no-summary", "--stdout", "--scan-archive=yes",
         "--max-filesize=500M", "--max-scansize=2000M", "--alert-exceeds-max=yes", "--alert-encrypted=no",
-        *targets,
+        *map(str, roots),
     ])
     with scan_lock(on_wait):
         res = run(cmd, capture_output=True, text=True, errors="replace")
     skipped: list[str] = []
     detected = False
+    reported: collections.Counter[str] = collections.Counter()
+    unexpected: list[str] = []
     for line in res.stdout.splitlines():
-        m = re.match(r"^(.*): (.+) FOUND$", line)
-        if m:
-            rel = os.path.relpath(m.group(1), d)
-            rel = rel.split("/", 1)[1] if "/" in rel else rel  # drop files/ or extracted/
-            if m.group(2).startswith("Heuristics.Limits.Exceeded"):
-                skipped.append(rel)
-            else:
-                detected = True
-                out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(2)}"))
+        # The path comes first and can itself contain ": ", so match the status at the end.
+        m = re.match(r"^(.*): (OK|Empty file|Symbolic link|(.+) FOUND)$", line)
+        if not m:
+            # A size-limit alert is followed by "<path>: Virus(es) detected ERROR".
+            alert = re.match(r"^(.*): Virus\(es\) detected ERROR$", line)
+            if line.strip() and not (alert and reported[alert.group(1)]):
+                unexpected.append(line)  # e.g. "<path>: Access denied"
+            continue
+        if m.group(2) == "Symbolic link":
+            continue  # never scanned and not counted as a file; see walk_files
+        reported[m.group(1)] += 1
+        if not m.group(3):
+            continue
+        rel = os.path.relpath(m.group(1), d)
+        rel = rel.split("/", 1)[1] if "/" in rel else rel  # drop files/ or extracted/
+        if m.group(3).startswith("Heuristics.Limits.Exceeded"):
+            skipped.append(rel)
+        else:
+            detected = True
+            out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(3)}"))
     out += too_big_for_clamav(d, skipped)
+    # Every regular file must show up exactly once. One that doesn't wasn't scanned
+    # (unreadable, swapped out mid-scan, or a name the output can't represent).
+    for root in roots:
+        for rel, _size in walk_files(root):
+            # Match the lossy decoding of ClamAV's output for names that aren't UTF-8.
+            shown = str(root / rel).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+            if reported[shown] > 0:
+                reported[shown] -= 1
+            else:
+                out.append(finding(DANGER, rel, "wasn't virus-scanned (ClamAV couldn't read it)"))
     # 0 = clean, 1 = detections. ClamAV counts a size-limit alert as an error (2), so
     # 2 is fine only when every error was one of those. Anything else (a crash, an
     # out-of-memory kill, a missing binary) means the scan didn't happen: fail closed.
     errors = [ln for ln in res.stderr.splitlines() if ln.strip() and "LibClamAV Warning" not in ln]
+    errors += [ln for ln in unexpected if "LibClamAV Warning" not in ln]
     finished = (res.returncode == 0 or (res.returncode == 1 and (detected or skipped))
                 or (res.returncode == 2 and skipped and not errors))
     if not finished:
-        # With -i, a file ClamAV can't read gives exit code 2 and no output at all.
-        why = (errors or [ln for ln in res.stdout.splitlines() if not ln.endswith(" FOUND")]
-               or ["no details; often a file it couldn't read"])[-1]
+        why = (errors or ["no details; often a file it couldn't read"])[-1]
         out.append(finding(DANGER, "", f"ClamAV didn't finish (exit code {res.returncode}: {why}); "
                                        "the virus scan is incomplete"))
     return out
@@ -1149,6 +1174,12 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         findings += sniff(rel, read_head(d / "files" / rel), category)
     set_phase(d, meta, "Unpacking archives")
     findings += extract_archives(d, files, d / "files", cfg, category)
+    # 7z restores the modes stored in the archive, so a file can arrive unreadable
+    # (mode 000) and ClamAV, running as the torrent user, would silently skip it.
+    # Take extracted/ away from the torrent user and make everything readable, so
+    # nothing running as that user can change or hide what ClamAV reads.
+    run(["chown", "-R", "--no-dereference", "root:root", str(d / "extracted")])
+    run(["chmod", "-R", "a+rX,go-w", str(d / "extracted")])  # -R doesn't follow symlinks
     set_phase(d, meta, "Virus scan (ClamAV)")
 
     def wait_for_other_scan():
