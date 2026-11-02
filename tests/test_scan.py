@@ -25,13 +25,18 @@ class Fake7z:
     def __init__(self, archives: dict):
         self.archives = archives
         self.extracted: list[str] = []
+        self.commands: list[list[str]] = []
 
     def __call__(self, cmd, **kw):
+        self.commands.append(cmd)
         if cmd[0] == "install":
             Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[:4] == ["runuser", "-u", "torrent", "--"]:
             cmd = cmd[4:]
+        if cmd[0] == "mkdir":
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[0] == "timeout":
             cmd = cmd[2:]
         src = Path(cmd[-1])
@@ -120,6 +125,63 @@ class ExtractArchives(unittest.TestCase):
                     "c.zip": {"files": {"d.zip": b"z"}}, "d.zip": {"files": {"x.lnk": b"x"}}}
         _out, fake = self.extract(archives, [("a.zip", 100)])
         self.assertEqual(fake.extracted, ["a.zip", "b.zip", "c.zip"])
+
+    def test_root_never_creates_folders_inside_extracted(self):
+        # Root's `install -d -o torrent` follows a planted symlink and gives its target to the torrent user.
+        archives = {"a.zip": {"files": {"b.zip": b"z"}}, "b.zip": {"files": {"c.zip": b"z"}},
+                    "c.zip": {"files": {"x.txt": b"x"}}}
+        _out, fake = self.extract(archives, [("a.zip", 100)])
+        self.assertEqual(fake.extracted, ["a.zip", "b.zip", "c.zip"])
+        inside = str(self.tmp / "extracted")
+        for cmd in fake.commands:
+            if any(a.startswith(inside) for a in cmd if not a.startswith("-o")):
+                self.assertEqual(cmd[:4], ["runuser", "-u", "torrent", "--"], cmd)
+        mkdirs = [c for c in fake.commands if "mkdir" in c]
+        self.assertEqual(len(mkdirs), 3)
+
+    def test_planted_symlink_at_unpack_target_is_danger(self):
+        victim = self.tmp / "victim"
+        victim.mkdir()
+        (self.tmp / "extracted").mkdir()
+        (self.tmp / "extracted" / "a.zip.d").symlink_to(victim)
+        out, fake = self.extract({"a.zip": {"files": {"x.txt": b"x"}}}, [("a.zip", 100)])
+        self.assertEqual([f["level"] for f in self.at(out, "a.zip")], [st.DANGER])
+        self.assertIn("possible tampering", out[0]["msg"])
+        self.assertNotIn("a.zip", fake.extracted)
+        self.assertEqual(list(victim.iterdir()), [])
+        self.assertFalse(any(c[0] == "install" for c in fake.commands))
+
+    def test_planted_symlink_at_nested_unpack_target_is_danger(self):
+        # The step-1 scenario: a compromised 7z plants a link where the inner archive will unpack.
+        victim = self.tmp / "victim"
+        victim.mkdir()
+
+        class Planting(Fake7z):
+            def __call__(self, cmd, **kw):
+                res = super().__call__(cmd, **kw)
+                if "x" in cmd and any(a.endswith("outer.zip") for a in cmd):
+                    out_dir = Path(next(a for a in cmd if a.startswith("-o"))[2:])
+                    (out_dir / "inner.zip.d").symlink_to(victim)
+                return res
+        fake = Planting({"outer.zip": {"files": {"inner.zip": b"z"}}, "inner.zip": {"files": {"x.txt": b"x"}}})
+        (self.root / "outer.zip").write_bytes(b"archive")
+        with mock.patch.object(st, "run", side_effect=fake):
+            out = st.extract_archives(self.tmp, [("outer.zip", 100)], self.root, {"MAX_EXTRACT_GB": 20}, "media")
+        self.assertTrue(any(f["level"] == st.DANGER and "possible tampering" in f["msg"]
+                            for f in self.at(out, "outer.zip.d/inner.zip")), out)
+        self.assertEqual(fake.extracted, ["outer.zip"])
+        self.assertEqual(list(victim.iterdir()), [])
+
+    def test_unpack_folder_resolving_outside_quarantine_is_danger(self):
+        # A link planted in a parent folder (mkdir -p runs as the torrent user, so it only gets that user's rights).
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (self.tmp / "extracted").mkdir()
+        (self.tmp / "extracted" / "Movie").symlink_to(elsewhere)
+        out, fake = self.extract({"a.zip": {"files": {"x.txt": b"x"}}}, [("Movie/a.zip", 100)])
+        self.assertEqual([f["level"] for f in self.at(out, "Movie/a.zip")], [st.DANGER])
+        self.assertIn("outside quarantine", out[0]["msg"])
+        self.assertEqual(fake.extracted, [])
 
     def test_failed_extraction(self):
         out, _ = self.extract({"a.rar": {"files": {"part.mkv": b"x"}, "rc": 2, "out": "Data error"}},
