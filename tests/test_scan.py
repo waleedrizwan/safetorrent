@@ -2,6 +2,7 @@
 a fake that "unpacks" archives from a table and clamscan by canned results, so
 these run anywhere."""
 import fcntl
+import os
 import shutil
 import subprocess
 import tempfile
@@ -224,6 +225,79 @@ class ClamAV(unittest.TestCase):
                              + self.line("files/film.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")))
         self.assertEqual(self.verdict(out), "INFECTED")
         self.assertFalse(any("didn't finish" in f["msg"] for f in out))
+
+    def put(self, rel, data=b"x"):
+        p = self.d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return f"{self.d}/{rel}"
+
+    def test_is_not_run_with_only_infected_output(self):
+        self.scan(clam(0))
+        self.assertNotIn("-i", self.cmd)  # per-file lines are needed to account for every file
+
+    def test_unreadable_file_next_to_a_big_video_is_not_clean(self):
+        # Reproduced in the VM: a mode-000 file in an archive, next to a movie ClamAV skips for size.
+        film = self.put("files/Film/big.mkv")
+        codec = self.put("extracted/extras.tar.d/codec.exe")
+        out = self.scan(clam(2, self.line("files/Film/big.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")
+                             + f"{film}: Virus(es) detected ERROR\n" + f"{codec}: Access denied\n"))
+        self.assertEqual(self.verdict(out), "SUSPICIOUS", out)
+        self.assertIn(st.finding(st.DANGER, "extras.tar.d/codec.exe", "wasn't virus-scanned (ClamAV couldn't read it)"), out)
+
+    def test_unreadable_file_with_no_output_at_all_is_not_clean(self):
+        film = self.put("files/Film/big.mkv")
+        self.put("extracted/extras.tar.d/codec.exe")
+        out = self.scan(clam(2, self.line("files/Film/big.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")
+                             + f"{film}: Virus(es) detected ERROR\n"))
+        self.assertEqual(self.verdict(out), "SUSPICIOUS", out)
+        self.assertEqual([f["path"] for f in out if f["level"] == st.DANGER], ["extras.tar.d/codec.exe"])
+
+    def test_unreadable_file_next_to_a_detection_is_still_reported(self):
+        # Exit code 1 (a detection) used to hide the "Access denied" line.
+        self.put("files/a.exe")
+        locked = self.put("files/b.exe")
+        out = self.scan(clam(1, self.line("files/a.exe", "Win.Trojan.X") + f"{locked}: Access denied\n"))
+        self.assertIn("b.exe", [f["path"] for f in out if f["level"] == st.DANGER])
+
+    def test_file_missing_from_clamav_output_is_not_clean(self):
+        self.put("files/Show/a.exe")
+        b = self.put("files/Show/b.mkv")
+        out = self.scan(clam(0, f"{b}: OK\n"))
+        self.assertEqual(self.verdict(out), "SUSPICIOUS", out)
+        self.assertEqual(out, [st.finding(st.DANGER, "Show/a.exe", "wasn't virus-scanned (ClamAV couldn't read it)")])
+
+    def test_every_file_accounted_for_is_clean(self):
+        a, b, e = self.put("files/Show/a.exe"), self.put("files/Show/x: OK"), self.put("files/empty", b"")
+        film = self.put("files/Show/film.mkv")
+        (self.d / "files" / "Show" / "link").symlink_to("a.exe")
+        out = self.scan(clam(2, f"{a}: OK\n{b}: OK\n{e}: Empty file\n{self.d}/files/Show/link: Symbolic link\n"
+                             + self.line("files/Show/film.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")
+                             + f"{film}: Virus(es) detected ERROR\n"))
+        self.assertEqual(self.verdict(out), "CLEAN", out)
+
+    def scan_names(self, names, stdout):
+        # macOS won't create names that aren't UTF-8, so give the scan the walk the VM would see.
+        (self.d / "files").mkdir(exist_ok=True)
+        walk = lambda root: [(n, 1) for n in names] if root.name == "files" else []
+        with mock.patch.object(st, "walk_files", side_effect=walk):
+            return self.scan(clam(0, stdout))
+
+    def test_name_that_isnt_utf8_still_matches(self):
+        # Seen in the VM: ClamAV prints the raw bytes, which decode to U+FFFD.
+        out = self.scan_names([os.fsdecode(b"bad\xffname")], f"{self.d}/files/bad\ufffdname: OK\n")
+        self.assertEqual(out, [])
+
+    def test_one_line_cant_vouch_for_two_files(self):
+        # Two names that ClamAV's lossy output can't tell apart need two lines.
+        out = self.scan_names([os.fsdecode(b"a\xfe"), os.fsdecode(b"a\xff")], f"{self.d}/files/a\ufffd: OK\n")
+        self.assertEqual(self.verdict(out), "SUSPICIOUS", out)
+
+    def test_unknown_output_line_is_an_error(self):
+        film = self.put("files/film.mkv")
+        out = self.scan(clam(2, self.line("files/film.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")
+                             + f"{film}: Virus(es) detected ERROR\nsomething unexpected\n"))
+        self.assertIn("didn't finish", out[-1]["msg"])
 
     def test_scans_take_turns(self):
         waited = threading.Event()
