@@ -155,6 +155,13 @@ take_lock() {
   echo $$ > "$lock/pid"
 }
 
+# One harmless file or folder name: not empty, at most 255 bytes, no /, no control
+# characters, and not hidden (which also rules out . and ..).
+safe_name() {
+  local LC_ALL=C
+  [[ -n "$1" && ${#1} -le 255 && "$1" != */* && "$1" != .* && "$1" != *[[:cntrl:]]* ]]
+}
+
 release() {
   local id=$1 force="" again="" info rid status verdict auto name
   shift
@@ -167,6 +174,15 @@ release() {
   done
   info=$(guest release-info "$id") || exit 1
   IFS=$'\t' read -r rid status verdict auto name <<< "$info"
+  # The VM is untrusted: a compromised one could send ../ in name or rid and write
+  # anywhere in your home folder. Check every field before it goes into a Mac path.
+  [[ "$rid" =~ ^[0-9a-f]{6,40}$ && "$rid" == "$id"* ]] || die "the VM returned an invalid id; not copying anything"
+  [[ "$auto" == auto || "$auto" == manual ]] || die "the VM returned bad data; not copying anything"
+  case "$verdict" in
+    CLEAN|WARNING|SUSPICIOUS|INFECTED|UNSCANNED|-) ;;
+    *) die "the VM returned bad data; not copying anything" ;;
+  esac
+  safe_name "$name" || die "the VM returned an unsafe name; not copying anything"
   case "$status" in
     scanned) ;;
     released) [[ -n "$again" ]] || die "$rid is already on your Mac. To copy it again: safetorrent release $rid --again" ;;
@@ -198,7 +214,11 @@ release() {
     dest="$DOWNLOAD_DIR/${stem} [${tag}]${ext}"; n=$((n + 1))
   done
   echo "Copying to ${dest}…"
-  mv "$src" "$dest"
+  # If something appeared at dest since the loop above, mv would overwrite it, or
+  # move the download inside it if it's a folder.
+  [[ -e "$dest" || -L "$dest" ]] && die "$dest appeared while copying; not overwriting it"
+  mv -n "$src" "$dest"
+  [[ ! -e "$src" && ! -L "$src" ]] || die "couldn't move the download into place without overwriting something"
   # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.
   find "$dest" -exec xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
   guest mark-released "$rid" "$dest"

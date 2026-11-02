@@ -95,6 +95,44 @@ class Release(unittest.TestCase):
                 self.assertIn("hasn't finished", res.stderr)
                 self.assert_nothing_copied(res)
 
+    def assert_refused(self, res, why):
+        self.assertIn(why, res.stderr)
+        self.assert_nothing_copied(res)
+        self.assertEqual(list(self.downloads.glob(".incoming-*")) if self.downloads.exists() else [], [])
+        self.assertFalse((self.home / "Library").exists())
+
+    def test_unsafe_names_from_the_vm_are_refused(self):
+        # The VM is untrusted: a compromised one could aim the copy at ~/Library/LaunchAgents.
+        for name in ("../../Library/LaunchAgents/x.plist", "..", ".", ".hidden", "a/b", "",
+                     "Show\x1b]52;c;x\x07", "Show\x7f", "x" * 256, "é" * 128):
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                self.assert_refused(self.release("scanned", "CLEAN", name), "unsafe name")
+
+    def test_bad_id_from_the_vm_is_refused(self):
+        for rid in ("../../x", "ffffff0000", "ABCDEF0123", "abcdef0123/..", ""):
+            with self.subTest(rid=rid):
+                self.log.unlink(missing_ok=True)
+                self.env["FAKE_RELEASE_INFO"] = "\t".join([rid, "scanned", "CLEAN", "auto", "Show"])
+                res = subprocess.run([str(ROOT / "safetorrent"), "release", RID], env=self.env,
+                                     capture_output=True, text=True, timeout=30)
+                self.assert_refused(res, "invalid id")
+
+    def test_unknown_verdict_or_auto_field_is_refused(self):
+        for verdict, auto in (("CLEAN;rm", "auto"), ("clean", "auto"), ("CLEAN", "yes"), ("CLEAN", "")):
+            with self.subTest(verdict=verdict, auto=auto):
+                self.log.unlink(missing_ok=True)
+                self.assert_refused(self.release("scanned", verdict, "Show", "--force", auto=auto), "bad data")
+
+    def test_ordinary_names_still_work(self):
+        for name in ("Amélie (2001) [1080p]", "Show S01", "x" * 255, "é" * 127, "Show: The Movie", "Show."):
+            with self.subTest(name=name):
+                res = self.release("scanned", "CLEAN", name)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertTrue(any(f"mark-released {RID} {self.downloads / name}" in c for c in self.calls()))
+                shutil.rmtree(self.downloads)
+                self.log.unlink()
+
     def test_name_clash_gets_id_suffix(self):
         (self.downloads / "Show").mkdir(parents=True)
         (self.downloads / "Show" / "mine.txt").write_text("keep me")
