@@ -930,7 +930,17 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
         if unpacked > min(max_bytes, free * 0.9) or (unpacked > 1024**3 and size and unpacked / size > 1000):
             out.append(finding(DANGER, rel, f"archive would unpack to {human(unpacked)}: too big to scan safely (possible zip bomb)"))
             continue
-        run(["install", "-d", "-o", TORRENT_USER, "-g", TORRENT_USER, str(dest)])
+        # dest is inside extracted/, which the torrent user can write to. Root must never
+        # create it: `install -d -o torrent` follows a planted symlink and hands the
+        # target to the torrent user. Created as that user, a planted link gets it nothing.
+        if dest.is_symlink() or dest.exists():
+            out.append(finding(DANGER, rel, "something was already where this archive unpacks (possible tampering)"))
+            continue
+        run(as_torrent_user(["mkdir", "-p", "--", str(dest)]))
+        if not os.path.realpath(dest).startswith(os.path.realpath(extracted_root) + os.sep):
+            out.append(finding(DANGER, rel, "the folder this archive unpacks into points outside quarantine "
+                                            "(possible tampering)"))
+            continue
         res = run(as_torrent_user(["timeout", "3600", sevenz, "x", "-y", NOPASS, f"-o{dest}", "--", str(src)]),
                   capture_output=True, text=True, errors="replace")
         if res.returncode != 0:
@@ -1165,6 +1175,7 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     meta["status"] = "scanning"
     claim(meta)
     shutil.rmtree(d / "extracted", ignore_errors=True)
+    # Safe as root: d is root-owned and extracted/ was just removed, so nothing can be planted here.
     run(["install", "-d", "-o", TORRENT_USER, "-g", TORRENT_USER, str(d / "extracted")])
     files = walk_files(d / "files")
     category = meta["category"]
@@ -1247,6 +1258,7 @@ def precheck(src: Path, cfg: dict, category: str | None, sha256: str | None,
     level = max_level(findings)
     d.mkdir(mode=0o755, exist_ok=True)  # root's: only files/ is the torrent user's
     (d / "source.torrent").write_bytes(data)
+    # Safe as root: d is root-owned, so the torrent user can't plant anything at files/.
     run(["install", "-d", "-o", TORRENT_USER, "-g", TORRENT_USER, str(d / "files")])
     biggest = sorted(info["files"], key=lambda f: -f[1])
     meta = {
