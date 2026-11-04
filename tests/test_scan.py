@@ -341,7 +341,8 @@ class ClamAV(unittest.TestCase):
     def scan_names(self, names, stdout):
         # macOS won't create names that aren't UTF-8, so give the scan the walk the VM would see.
         (self.d / "files").mkdir(exist_ok=True)
-        walk = lambda root: [(n, 1) for n in names] if root.name == "files" else []
+        def walk(root):
+            return [(n, 1) for n in names] if root.name == "files" else []
         with mock.patch.object(st, "walk_files", side_effect=walk):
             return self.scan(clam(0, stdout))
 
