@@ -923,7 +923,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
                       capture_output=True, text=True, errors="replace")
         text = listing.stdout + listing.stderr
         if re.search(r"Wrong password|Encrypted = \+|Can not open encrypted", text):
-            out.append(finding(DANGER, rel, "password-protected archive: can't be scanned (a common way to smuggle malware)"))
+            out.append(finding(DANGER, rel, "password-protected archive: can't be scanned (a common way to smuggle malware)",
+                               encrypted=True))
             continue
         unpacked = sum(int(n) for n in re.findall(r"^Size = (\d+)", listing.stdout, re.M))
         free = shutil.disk_usage(QUARANTINE).free
@@ -945,7 +946,7 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
                   capture_output=True, text=True, errors="replace")
         if res.returncode != 0:
             if re.search(r"Wrong password|encrypted", res.stdout + res.stderr, re.I):
-                out.append(finding(DANGER, rel, "password-protected archive: can't be scanned"))
+                out.append(finding(DANGER, rel, "password-protected archive: can't be scanned", encrypted=True))
             else:
                 out.append(finding(WARN, rel, "archive couldn't be fully extracted (damaged or unsupported); only partly scanned"))
         inner = walk_files(dest)
@@ -958,6 +959,10 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
             for f in nested:
                 f["path"] = str(Path(rel + ".d") / f["path"])
             out += nested
+        elif any(kind_of(ext_of(p)) == "archive" or ext_of(p) in UNPACKABLE_IMAGES for p, _ in inner):
+            # ClamAV still looks inside these, but nothing checks their names or contents' types.
+            out.append(finding(WARN, rel, "contains archives nested more than 3 deep; those weren't "
+                                          "unpacked, so their file names weren't checked"))
     return out
 
 
@@ -990,7 +995,8 @@ def too_big_for_clamav(d: Path, skipped: list[str]) -> list[dict]:
     return out
 
 
-def clamav_scan(d: Path, on_wait=None) -> list[dict]:
+def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list[dict]:
+    """flagged: paths already reported as password-protected, so they aren't reported twice."""
     daily = sorted(CLAMAV_DB.glob("daily.c[lv]d"))
     if not daily:
         die("the virus database hasn't downloaded yet; run `safetorrent update` and try again")
@@ -1005,7 +1011,11 @@ def clamav_scan(d: Path, on_wait=None) -> list[dict]:
     # accounted for. A file it couldn't open just goes missing from the output.
     cmd = as_torrent_user([
         "clamscan", "-r", "--no-summary", "--stdout", "--scan-archive=yes",
-        "--max-filesize=500M", "--max-scansize=2000M", "--alert-exceeds-max=yes", "--alert-encrypted=no",
+        "--max-filesize=500M", "--max-scansize=2000M", "--alert-exceeds-max=yes",
+        # 7z only checks files with an archive extension, 3 levels deep. ClamAV also catches a
+        # locked zip renamed to .dat or nested deeper. Encrypted PDFs and Office files are common
+        # and harmless, so those aren't flagged.
+        "--alert-encrypted-archive=yes", "--alert-encrypted-doc=no",
         *map(str, roots),
     ])
     with scan_lock(on_wait):
@@ -1032,6 +1042,11 @@ def clamav_scan(d: Path, on_wait=None) -> list[dict]:
         rel = rel.split("/", 1)[1] if "/" in rel else rel  # drop files/ or extracted/
         if m.group(3).startswith("Heuristics.Limits.Exceeded"):
             skipped.append(rel)
+        elif m.group(3).startswith("Heuristics.Encrypted"):
+            detected = True  # it's an alert, so exit code 1 still means the scan finished
+            if rel not in flagged:
+                out.append(finding(DANGER, rel, "password-protected archive (or one inside it): can't be "
+                                                "scanned (a common way to smuggle malware)", encrypted=True))
         else:
             detected = True
             out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(3)}"))
@@ -1170,6 +1185,10 @@ def trust_checksum(findings: list[dict]) -> None:
 
 
 def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
+    # 7z and ClamAV run as the torrent user on hostile files, so the torrent user's
+    # network limits must be up first. Rules don't survive a VM reboot, and rescan
+    # and --scan-only don't go through prepare().
+    ensure_firewall(vpn_enabled(cfg))
     if not quiet:
         print(paint("\nScanning…", "1"), flush=True)
     meta["status"] = "scanning"
@@ -1197,7 +1216,8 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         set_phase(d, meta, "Waiting for another virus scan to finish")
         if not quiet:
             print("Waiting for another virus scan to finish…", flush=True)
-    findings += clamav_scan(d, on_wait=wait_for_other_scan)
+    locked = frozenset(f["path"] for f in findings if f.get("encrypted"))
+    findings += clamav_scan(d, on_wait=wait_for_other_scan, flagged=locked)
     set_phase(d, meta, "VirusTotal lookups")
     findings += virustotal(d, cfg, category, (lambda msg: set_phase(d, meta, msg)) if quiet else None)
     if meta.get("sha256"):

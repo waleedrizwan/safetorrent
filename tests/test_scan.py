@@ -126,6 +126,23 @@ class ExtractArchives(unittest.TestCase):
         _out, fake = self.extract(archives, [("a.zip", 100)])
         self.assertEqual(fake.extracted, ["a.zip", "b.zip", "c.zip"])
 
+    def test_archives_past_the_depth_limit_are_a_warning(self):
+        archives = {"a.zip": {"files": {"b.zip": b"z"}}, "b.zip": {"files": {"c.zip": b"z"}},
+                    "c.zip": {"files": {"d.zip": b"z"}}, "d.zip": {"files": {"x.lnk": b"x"}}}
+        out, _ = self.extract(archives, [("a.zip", 100)])
+        deep = [f for f in out if "nested more than 3 deep" in f["msg"]]
+        self.assertEqual([(f["path"], f["level"]) for f in deep], [("a.zip.d/b.zip.d/c.zip", st.WARN)], out)
+
+    def test_three_levels_with_nothing_deeper_is_not_a_warning(self):
+        archives = {"a.zip": {"files": {"b.zip": b"z"}}, "b.zip": {"files": {"c.zip": b"z"}},
+                    "c.zip": {"files": {"x.txt": b"x"}}}
+        out, _ = self.extract(archives, [("a.zip", 100)])
+        self.assertFalse(any("nested" in f["msg"] for f in out), out)
+
+    def test_password_protected_is_tagged_so_clamav_doesnt_repeat_it(self):
+        out, _ = self.extract({"a.zip": {"listing": "Encrypted = +\n"}}, [("a.zip", 100)])
+        self.assertTrue(out[0]["encrypted"])
+
     def test_root_never_creates_folders_inside_extracted(self):
         # Root's `install -d -o torrent` follows a planted symlink and gives its target to the torrent user.
         archives = {"a.zip": {"files": {"b.zip": b"z"}}, "b.zip": {"files": {"c.zip": b"z"}},
@@ -287,6 +304,34 @@ class ClamAV(unittest.TestCase):
                              + self.line("files/film.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")))
         self.assertEqual(self.verdict(out), "INFECTED")
         self.assertFalse(any("didn't finish" in f["msg"] for f in out))
+
+    def test_flags_password_protected_archives(self):
+        self.scan(clam(0))
+        self.assertIn("--alert-encrypted-archive=yes", self.cmd)
+        self.assertIn("--alert-encrypted-doc=no", self.cmd)  # locked PDFs are common and harmless
+        self.assertNotIn("--alert-encrypted=no", self.cmd)
+
+    def test_renamed_or_deeply_nested_locked_archive_is_not_clean(self):
+        # The three bypasses from the audit: ClamAV catches each one, and 7z's check doesn't.
+        for rel, sig in (("files/data.dat", "Heuristics.Encrypted.Zip"),
+                         ("files/setup.bin", "Heuristics.Encrypted.7Zip"),
+                         ("extracted/a.zip.d/b.zip.d/c.zip.d/d.zip", "Heuristics.Encrypted.Zip")):
+            with self.subTest(rel=rel):
+                out = self.scan(clam(1, self.line(rel, sig)))
+                self.assertEqual(self.verdict(out), "SUSPICIOUS", out)
+                self.assertIn("password-protected", out[0]["msg"])
+                self.assertFalse(any("didn't finish" in f["msg"] for f in out), out)
+
+    def test_locked_archive_next_to_a_big_video_still_finishes(self):
+        out = self.scan(clam(1, self.line("files/extras.dat", "Heuristics.Encrypted.Zip")
+                             + self.line("files/film.mkv", "Heuristics.Limits.Exceeded.MaxFileSize")))
+        self.assertEqual(self.verdict(out), "SUSPICIOUS", out)
+        self.assertFalse(any("didn't finish" in f["msg"] for f in out), out)
+
+    def test_archive_7z_already_flagged_isnt_reported_twice(self):
+        with mock.patch.object(st, "run", return_value=clam(1, self.line("files/a.zip", "Heuristics.Encrypted.Zip"))):
+            out = st.clamav_scan(self.d, flagged=frozenset({"a.zip"}))
+        self.assertEqual(out, [])
 
     def put(self, rel, data=b"x"):
         p = self.d / rel
