@@ -176,11 +176,12 @@ class ReleaseState(Base):
 
     def scan(self, **meta):
         d = self.make(status="downloaded", category="media", **meta)
-        quiet = mock.patch.multiple(st, run=mock.DEFAULT, walk_files=mock.Mock(return_value=[]),
+        quiet = mock.patch.multiple(st, run=mock.DEFAULT, ensure_firewall=mock.DEFAULT,
+                                    walk_files=mock.Mock(return_value=[]),
                                     extract_archives=mock.Mock(return_value=[]),
                                     clamav_scan=mock.Mock(return_value=[]), virustotal=mock.Mock(return_value=[]))
         with quiet:
-            st.scan(d, st.load_meta(d), {}, quiet=True)
+            st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
         return st.load_meta(d)["status"]
 
     def test_extracted_is_locked_before_clamav(self):
@@ -188,15 +189,37 @@ class ReleaseState(Base):
         d = self.make(status="downloaded", category="media")
         calls = []
         with mock.patch.multiple(st, run=mock.Mock(side_effect=lambda cmd, **kw: calls.append(cmd)),
-                                 walk_files=mock.Mock(return_value=[]),
+                                 ensure_firewall=mock.DEFAULT, walk_files=mock.Mock(return_value=[]),
                                  extract_archives=mock.Mock(side_effect=lambda *a, **kw: calls.append("7z") or []),
                                  clamav_scan=mock.Mock(side_effect=lambda *a, **kw: calls.append("clamav") or []),
                                  virustotal=mock.Mock(return_value=[])):
-            st.scan(d, st.load_meta(d), {}, quiet=True)
+            st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
         extracted = str(d / "extracted")
         lock = [["chown", "-R", "--no-dereference", "root:root", extracted], ["chmod", "-R", "a+rX,go-w", extracted]]
         i = calls.index("7z")
         self.assertEqual(calls[i + 1:i + 4], lock + ["clamav"])
+
+    def test_firewall_is_up_before_anything_unpacks(self):
+        """rescan and --scan-only skip prepare(), and the rules are gone after a VM reboot."""
+        d = self.make(status="downloaded", category="media")
+        calls = []
+        with mock.patch.multiple(st, run=mock.DEFAULT, walk_files=mock.Mock(return_value=[]),
+                                 ensure_firewall=mock.Mock(side_effect=lambda vpn: calls.append(("firewall", vpn))),
+                                 extract_archives=mock.Mock(side_effect=lambda *a, **kw: calls.append("7z") or []),
+                                 clamav_scan=mock.Mock(side_effect=lambda *a, **kw: calls.append("clamav") or []),
+                                 virustotal=mock.Mock(return_value=[])):
+            st.scan(d, st.load_meta(d), {"USE_VPN": "yes"}, quiet=True)
+        self.assertEqual(calls, [("firewall", True), "7z", "clamav"])
+
+    def test_archive_7z_flagged_is_not_reported_again_by_clamav(self):
+        d = self.make(status="downloaded", category="media")
+        locked = st.finding(st.DANGER, "a.zip", "password-protected archive", encrypted=True)
+        with mock.patch.multiple(st, run=mock.DEFAULT, ensure_firewall=mock.DEFAULT,
+                                 walk_files=mock.Mock(return_value=[]),
+                                 extract_archives=mock.Mock(return_value=[locked]),
+                                 clamav_scan=mock.Mock(return_value=[]), virustotal=mock.Mock(return_value=[])):
+            st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
+            self.assertEqual(st.clamav_scan.call_args.kwargs["flagged"], frozenset({"a.zip"}))
 
     def test_rescanning_something_already_copied_keeps_it_released(self):
         # Otherwise a rescan makes it look new, and the app or CLI copies it again.
