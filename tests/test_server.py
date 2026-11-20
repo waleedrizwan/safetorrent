@@ -63,7 +63,8 @@ class ServerBase(unittest.TestCase):
         self.guest = mock.patch.object(self.srv, "guest").start()
         self.push = mock.patch.object(self.srv, "push_inbox").start()
         mock.patch.object(self.srv, "refresh_health").start()
-        mock.patch.object(self.srv, "refresh_items").start()
+        self.refresh = mock.patch.object(self.srv, "refresh_items")
+        self.refresh.start()
         self.srv.State.health = {"blocked": False, "checks": []}
         self.addCleanup(mock.patch.stopall)
 
@@ -337,13 +338,13 @@ XSS2 = '<script>document.title="PWNED"</script>'
 def hostile_state():
     finding = {"level": 2, "path": XSS + "/codec.exe", "msg": XSS2}
     item = {
-        "id": "abcdef0123", "name": "Movie " + XSS, "total": 1000, "file_count": 2, "category": "media",
+        "id": "abcdef0123", "name": "Movie " + XSS, "total": XSS, "file_count": XSS, "category": "media",
         "status": "scanned", "phase": XSS, "error": XSS2, "auto_release": False, "released_to": XSS,
-        "files": [{"path": XSS, "size": 10}],
+        "files": [{"path": XSS, "size": XSS}],
         "precheck": {"verdict": "OK", "findings": [finding]},
         "scan": {"verdict": "WARNING", "findings": [finding]},
     }
-    stopped = dict(item, id="abcdef0124", status="vpn-failed", scan=None, name=XSS2)
+    stopped = dict(item, id='abcdef0124"><img src="x', status="vpn-failed", scan=None, name=XSS2)
     return {
         "vm": "Running", "free": 10**10, "items_error": None, "busy": {}, "errors": {"abcdef0123": XSS},
         "health": {"blocked": True, "checks": [
@@ -352,6 +353,69 @@ def hostile_state():
         "settings": {"vt_key_set": True, "vt_key_hint": XSS, "use_vpn": True, "vpn_config_present": True,
                      "download_dir": XSS, "seed_minutes": "0"},
     }
+
+
+class UntrustedItems(ServerBase):
+    """Everything in an item comes from the VM, which a compromised download could control."""
+    ID = "abcdef0123"
+
+    def downloads(self) -> Path:
+        d = Path(self.home) / "Downloads" / "SafeTorrents"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def reveal(self, released_to):
+        self.srv.State.items = [{"id": self.ID, "status": "released", "released_to": released_to}]
+        # Patched rather than read from HOME: setUp's stopall also undoes the class's HOME patch.
+        with mock.patch.object(self.srv.subprocess, "run") as run, \
+                mock.patch.object(self.srv, "download_dir", return_value=self.downloads()):
+            status = self.request("POST", f"/api/items/{self.ID}/reveal", {})[0]
+        return status, [c.args[0] for c in run.call_args_list]
+
+    def test_reveal_refuses_paths_outside_downloads(self):
+        self.downloads()
+        for target in ("/etc", "-a/Applications/Calculator.app", "/System/Applications/Utilities/Terminal.app",
+                       str(self.downloads() / ".." / ".."), str(self.downloads()), 5, None):
+            with self.subTest(target=target):
+                status, calls = self.reveal(target)
+                self.assertEqual(status, 400)
+                self.assertEqual(calls, [])
+
+    def test_reveal_refuses_a_symlink_out_of_downloads(self):
+        (self.downloads() / "Linked").symlink_to("/etc")
+        status, calls = self.reveal(str(self.downloads() / "Linked"))
+        self.assertEqual((status, calls), (400, []))
+
+    def test_reveal_inside_downloads_works(self):
+        show = self.downloads() / "Show"
+        show.mkdir(exist_ok=True)
+        status, calls = self.reveal(str(show))
+        self.assertEqual(status, 200)
+        self.assertEqual(calls, [["open", "-R", str(show.resolve())]])
+
+    def test_bad_items_from_the_vm_are_dropped_or_coerced(self):
+        self.refresh.stop()
+        self.guest.return_value = {"free": "lots", "items": [
+            {"id": "../x", "status": "scanned"}, "not a dict",
+            {"id": self.ID, "status": "pwned", "total": "<b>x</b>", "file_count": -3,
+             "files": [{"path": "a", "size": "<i>"}], "precheck": {"verdict": "<b>"},
+             "scan": {"verdict": "CLEAN<b>", "findings": [{"level": "9", "path": 1, "msg": None}]}}]}
+        self.srv.refresh_items()
+        items = self.srv.State.items
+        self.assertEqual([m["id"] for m in items], [self.ID])
+        m = items[0]
+        self.assertEqual((m["status"], m["total"], m["file_count"], m["files"][0]["size"]), ("broken", 0, 0, 0))
+        self.assertEqual(m["precheck"]["verdict"], "WARNING")
+        self.assertEqual(m["scan"]["verdict"], "SUSPICIOUS")  # never CLEAN, so never auto-released
+        self.assertEqual(m["scan"]["findings"], [{"level": 3, "path": "1", "msg": ""}])
+        self.assertEqual(self.srv.State.free, 0)
+
+    def test_ordinary_items_pass_through(self):
+        item = {"id": self.ID, "name": "Show", "status": "scanned", "total": 1000, "file_count": 2,
+                "files": [{"path": "Show/a.mkv", "size": 900}], "auto_release": True,
+                "precheck": {"verdict": "OK", "findings": []},
+                "scan": {"verdict": "CLEAN", "findings": [{"level": 0, "path": "", "msg": "fine"}], "at": "now"}}
+        self.assertEqual(self.srv.sanitize_item(item), item)
 
 
 @unittest.skipUnless(os.path.exists(CHROME), "needs Google Chrome for the browser check")

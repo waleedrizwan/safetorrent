@@ -189,11 +189,61 @@ def refresh_health() -> None:
             State.health_error = str(e)
 
 
+ITEM_ID = re.compile(r"[0-9a-f]{6,40}")
+STATUSES = {"prechecked", "rejected", "skipped", "queued", "downloading", "incomplete", "vpn-failed",
+            "blocked", "downloaded", "scanning", "scanned", "released", "broken"}
+PRE_VERDICTS = {"OK", "WARNING", "REJECTED"}
+SCAN_VERDICTS = {"CLEAN", "WARNING", "SUSPICIOUS", "INFECTED"}
+
+
+def count(v) -> int:
+    try:
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(n, 0)
+
+
+def clean_findings(findings) -> list:
+    out = []
+    for f in findings if isinstance(findings, list) else []:
+        if isinstance(f, dict):
+            level = min(count(f.get("level")), 3)
+            out.append({**f, "level": level, "path": str(f.get("path") or ""), "msg": str(f.get("msg") or "")})
+    return out
+
+
+def sanitize_item(m) -> dict | None:
+    """The VM is untrusted (root there can write meta.json). This is where its data
+    enters the app, so every field the page or the auto-release relies on is checked
+    here. Returns None for an item that can't be identified."""
+    if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not ITEM_ID.fullmatch(m["id"]):
+        return None
+    m = dict(m)
+    m["status"] = m.get("status") if m.get("status") in STATUSES else "broken"
+    m["total"], m["file_count"] = count(m.get("total")), count(m.get("file_count"))
+    files = m.get("files")
+    m["files"] = [{"path": str(f.get("path") or ""), "size": count(f.get("size"))}
+                  for f in (files if isinstance(files, list) else []) if isinstance(f, dict)]
+    pre = m.get("precheck")
+    pre = pre if isinstance(pre, dict) else {}
+    m["precheck"] = {"verdict": pre["verdict"] if pre.get("verdict") in PRE_VERDICTS else "WARNING",
+                     "findings": clean_findings(pre.get("findings"))}
+    if m.get("scan") is not None:
+        scan = m["scan"] if isinstance(m["scan"], dict) else {}
+        # An unknown verdict is never treated as clean.
+        m["scan"] = {**scan, "verdict": scan.get("verdict") if scan.get("verdict") in SCAN_VERDICTS else "SUSPICIOUS",
+                     "findings": clean_findings(scan.get("findings"))}
+    m["auto_release"] = m.get("auto_release") is not False
+    return m
+
+
 def refresh_items() -> None:
     try:
         data = guest("items", timeout=60)
+        items = [i for i in map(sanitize_item, data["items"]) if i is not None]
         with State.lock:
-            State.items, State.free, State.items_error = data["items"], data["free"], None
+            State.items, State.free, State.items_error = items, count(data["free"]), None
     except ApiError as e:
         with State.lock:
             State.items_error = str(e)
@@ -357,9 +407,13 @@ def item_action(item_id: str, action: str, body) -> dict:
     elif action == "reveal":
         item = next((m for m in State.items if m["id"] == item_id), None)
         target = item and item.get("released_to")
-        if not target or not Path(target).exists():
+        # From the VM, so untrusted: only ever reveal something inside the downloads folder.
+        if not isinstance(target, str) or not target.startswith("/"):
             raise ApiError("That download isn't on your Mac anymore.")
-        subprocess.run(["open", "-R", target])
+        resolved = Path(target).resolve()
+        if download_dir().resolve() not in resolved.parents or not resolved.exists():
+            raise ApiError("That download isn't on your Mac anymore.")
+        subprocess.run(["open", "-R", str(resolved)])  # absolute, so never read as an option
     else:
         raise ApiError("Unknown action.")
     refresh_items()

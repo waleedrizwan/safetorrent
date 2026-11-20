@@ -38,7 +38,10 @@ function toast(msg, err = false) {
   setTimeout(() => el.remove(), err ? 9000 : 4500);
 }
 
+// Sizes come from the VM, which is untrusted: never echo one back as text.
 function human(n) {
+  n = Number(n);
+  if (!Number.isFinite(n) || n < 0) return "?";
   const u = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
@@ -168,7 +171,7 @@ function progressLine(m) {
 }
 
 function actions(m) {
-  const id = m.id, v = m.scan && m.scan.verdict, st = m.status, pre = m.precheck.verdict;
+  const id = esc(m.id), v = m.scan && m.scan.verdict, st = m.status, pre = m.precheck.verdict;
   const b = (act, label, cls = "quiet") => `<button class="btn small ${cls}" data-act="${act}" data-id="${id}">${label}</button>`;
   const out = [];
   if (["prechecked", "skipped"].includes(st)) out.push(b("start", pre === "WARNING" ? "Download anyway" : "Download into quarantine", ""));
@@ -212,11 +215,12 @@ function renderItems() {
     const findings = m.scan ? m.scan.findings : m.precheck.findings;
     const isOpen = openDetails.has(m.id) || ["prechecked", "rejected", "skipped"].includes(m.status) && !openDetails.has("closed:" + m.id);
     const cats = { media: "Movies, TV or music", software: "Software", docs: "Books or documents", iso: "Disk image" };
+    const count = Number.isInteger(Number(m.file_count)) ? Number(m.file_count) : "?";
     return `<article class="item">
       <div class="item-top">
         <div>
           <div class="item-name">${esc(m.name)}</div>
-          <div class="item-facts"><span>${human(m.total)}</span><span>${m.file_count} file${m.file_count === 1 ? "" : "s"}</span>
+          <div class="item-facts"><span>${human(m.total)}</span><span>${count} file${count === 1 ? "" : "s"}</span>
             <span>${cats[m.category] || esc(m.category)}</span></div>
         </div>
         <div class="verdict ${vCls}">${esc(vText)}</div>
@@ -229,7 +233,7 @@ function renderItems() {
       ${progressLine(m) ? `<p class="item-msg">${esc(progressLine(m))}</p>` : ""}
       ${err ? `<p class="item-msg err">${esc(err)}</p>` : ""}
       <div class="item-actions">${actions(m)}
-        <button class="details-toggle" data-toggle="${m.id}" aria-expanded="${isOpen}">${isOpen ? "Hide details" : "Details"}</button>
+        <button class="details-toggle" data-toggle="${esc(m.id)}" aria-expanded="${isOpen}">${isOpen ? "Hide details" : "Details"}</button>
       </div>
       ${isOpen ? `<div class="details">
         <h2 style="font-size:14px">${m.scan ? "Scan findings" : "What the file-list check found"}</h2>
