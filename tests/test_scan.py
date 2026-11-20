@@ -312,6 +312,13 @@ class ClamAV(unittest.TestCase):
                              + self.line("files/b.js", "winnow.compromised.ts.jsexploit.2")))
         self.assertEqual([f["level"] for f in out], [st.DANGER, st.DANGER])
         self.assertIn("Sanesecurity", out[0]["msg"])
+        self.assertIn("--allmatch", self.cmd)
+
+    def test_clamavs_own_detection_wins_over_an_extra_list(self):
+        """With --allmatch both are reported; the file is INFECTED, said once."""
+        out = self.scan(clam(1, self.line("files/eicar.com", "winnow.malware.test.eicar.com.UNOFFICIAL")
+                             + self.line("files/eicar.com", "Eicar-Signature")))
+        self.assertEqual([(f["level"], f["msg"]) for f in out], [(st.INFECTED, "ClamAV detected Eicar-Signature")])
         self.assertIn("--alert-exceeds-max=yes", self.cmd)
 
     def test_detection(self):
