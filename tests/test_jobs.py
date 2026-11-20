@@ -382,6 +382,19 @@ class Update(unittest.TestCase):
         self.assertEqual(apt[0][0], "systemd-run")
         self.assertIn("--wait", apt[0])
         self.assertFalse(any(c[0] == "apt-get" for c in calls))
+        # VMs built before a tool was added get it here.
+        self.assertIn("install -y -qq --no-install-recommends ffmpeg python3-pikepdf python3-yara", apt[0][-1])
+
+    def test_missing_tools_block_downloads_until_update(self):
+        with mock.patch.object(st.shutil, "which", return_value=None), \
+             mock.patch.object(st, "python_module_ok", return_value=True):
+            state, *_rest, fix = st.tools_check()
+        self.assertEqual((state, fix), ("block", "update"))
+        with mock.patch.object(st.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+             mock.patch.object(st, "python_module_ok", side_effect=lambda m: m != "yara"):
+            self.assertEqual(st.missing_packages(), ["python3-yara"])
+            with mock.patch.object(st, "python_module_ok", return_value=True):
+                self.assertEqual(st.tools_check()[0], "ok")
 
 
 if __name__ == "__main__":

@@ -861,6 +861,7 @@ def check_health(cfg: dict) -> dict:
         add("vpn", "warn", "VPN is off", "Other people in the torrent can see your real IP address", "enable_vpn")
 
     add("virusdb", *virusdb_check())
+    add("tools", *tools_check())
 
     key = cfg["VT_API_KEY"]
     if not key:
@@ -918,6 +919,28 @@ def obtain_torrent(src: Path, cfg: dict) -> bytes:
             return fh.read()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Scanning tools beyond the VM's first install: ffmpeg rebuilds media, pikepdf strips
+# scripts from PDFs, yara matches YARA rules. `safetorrent update` installs them.
+SCAN_PACKAGES = {"ffmpeg": "ffmpeg", "python3-pikepdf": "pikepdf", "python3-yara": "yara"}
+
+
+def python_module_ok(name: str) -> bool:
+    return run(["/usr/bin/python3", "-I", "-c", f"import {name}"], capture_output=True).returncode == 0
+
+
+def missing_packages() -> list[str]:
+    return [pkg for pkg, what in SCAN_PACKAGES.items()
+            if not (shutil.which(what) if pkg == what else python_module_ok(what))]
+
+
+def tools_check() -> tuple:
+    missing = missing_packages()
+    if missing:
+        return ("block", "Scanning tools are missing", f"Not installed yet: {', '.join(missing)}. "
+                "Update installs them.", "update")
+    return "ok", "Scanning tools installed", "ClamAV, YARA, and ffmpeg/pikepdf for rebuilding media"
 
 
 def set_phase(d: Path, meta: dict, phase: str) -> None:
@@ -1936,7 +1959,8 @@ def cmd_update(args, cfg) -> int:
     # going instead of being killed halfway through an upgrade.
     res = run(["systemd-run", "--unit=safetorrent-apt", "--wait", "--collect", "--quiet",
                "--setenv=DEBIAN_FRONTEND=noninteractive", "/bin/sh", "-c",
-               "apt-get update -qq && apt-get upgrade -y -qq"], capture_output=True, text=True)
+               "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+               + " ".join(SCAN_PACKAGES) + " && apt-get upgrade -y -qq"], capture_output=True, text=True)
     if res.returncode != 0:
         detail = (res.stderr.strip().splitlines() or ["see `journalctl -u safetorrent-apt`"])[-1]
         print(paint(f"Security updates didn't finish: {detail}", "33"))
