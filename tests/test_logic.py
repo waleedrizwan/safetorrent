@@ -357,6 +357,17 @@ class Authenticode(unittest.TestCase):
         self.assertIn("changed after it was signed", findings[1]["msg"])
 
 
+class ExtraSignatures(unittest.TestCase):
+    def test_only_the_malware_lists_are_switched_on(self):
+        conf = st.fangfrisch_conf()
+        self.assertIn("enabled = yes", conf)
+        off = {line.split()[0][4:] for line in conf.splitlines() if line.startswith("url_")}
+        for spam in ("junk", "phish", "scam", "spamattach", "foxhole_generic", "foxhole_js_ndb", "shelter"):
+            self.assertIn(spam, off)
+        for kept in ("badmacro", "malwarehash", "rogue", "winnow_malware"):
+            self.assertNotIn(kept, off)
+
+
 class Verdicts(unittest.TestCase):
     def test_worst_finding_wins(self):
         f = [st.finding(st.INFO, "", "a"), st.finding(st.WARN, "", "b"), st.finding(st.INFECTED, "", "c")]

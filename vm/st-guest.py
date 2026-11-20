@@ -882,6 +882,7 @@ def check_health(cfg: dict) -> dict:
     add("virusdb", *virusdb_check())
     add("tools", *tools_check())
     add("yara", *yara_check())
+    add("extra_sigs", *extra_signatures_check())
 
     key = cfg["VT_API_KEY"]
     if not key:
@@ -942,9 +943,11 @@ def obtain_torrent(src: Path, cfg: dict) -> bytes:
 
 
 # Scanning tools beyond the VM's first install: ffmpeg rebuilds media, pikepdf strips
-# scripts from PDFs, yara matches YARA rules, osslsigncode checks Windows signatures.
+# scripts from PDFs, yara matches YARA rules, osslsigncode checks Windows signatures,
+# fangfrisch fetches extra ClamAV signatures.
 # `safetorrent update` installs them.
-SCAN_PACKAGES = {"ffmpeg": "ffmpeg", "python3-pikepdf": "pikepdf", "python3-yara": "yara", "osslsigncode": "osslsigncode"}
+SCAN_PACKAGES = {"ffmpeg": "ffmpeg", "python3-pikepdf": "pikepdf", "python3-yara": "yara", "osslsigncode": "osslsigncode",
+                 "fangfrisch": "fangfrisch"}
 
 
 def python_module_ok(name: str) -> bool:
@@ -1206,6 +1209,68 @@ def too_big_for_clamav(d: Path, skipped: list[str]) -> list[dict]:
     return out
 
 
+# Extra ClamAV signatures from Sanesecurity, kept current by fangfrisch (as the clamav
+# user, in its own sandboxed unit). Only the malware lists: most of Sanesecurity is spam
+# and phishing rules for email, which would misfire on text in torrents.
+FANGFRISCH_CONF = Path("/etc/fangfrisch.conf")
+FANGFRISCH_DB = Path("/var/lib/fangfrisch/db.sqlite")
+EXTRA_SIGNATURES = ("badmacro.ndb", "malwarehash.hsb", "hackingteam.hsb", "rogue.hdb", "winnow_malware.hdb",
+                    "winnow_extended_malware.hdb", "winnow_malware_links.ndb", "winnow_extended_malware_links.ndb",
+                    "malware.expert.hdb", "malware.expert.ndb", "malware.expert.ldb", "malware.expert.fp",
+                    "sigwhitelist.ign2")
+EXTRA_SIGNATURE_PREFIXES = ("Sanesecurity.", "winnow.")
+SANESECURITY_MIRROR = "https://mirror.rollernet.us/sanesecurity/"
+EXTRA_SIGNATURES_MAX_AGE_DAYS = 7
+
+
+def fangfrisch_conf() -> str:
+    """Every Sanesecurity list fangfrisch knows is switched off except EXTRA_SIGNATURES."""
+    every = {"badmacro.ndb": "badmacro", "blurl.ndb": "blurl", "bofhland_cracked_URL.ndb": "bofhland_cracked_url",
+             "bofhland_malware_attach.hdb": "bofhland_malware_attach", "bofhland_malware_URL.ndb": "bofhland_malware_url",
+             "bofhland_phishing_URL.ndb": "bofhland_phishing_url", "foxhole_filename.cdb": "foxhole_filename",
+             "foxhole_generic.cdb": "foxhole_generic", "foxhole_js.cdb": "foxhole_js_cdb", "foxhole_js.ndb": "foxhole_js_ndb",
+             "hackingteam.hsb": "hackingteam", "junk.ndb": "junk", "jurlbl.ndb": "jurlbl", "jurlbla.ndb": "jurlbla",
+             "lott.ndb": "lott", "malware.expert.fp": "malwareexpert_fp", "malware.expert.hdb": "malwareexpert_hdb",
+             "malware.expert.ldb": "malwareexpert_ldb", "malware.expert.ndb": "malwareexpert_ndb",
+             "malwarehash.hsb": "malwarehash", "phish.ndb": "phish", "phishtank.ndb": "phishtank",
+             "porcupine.ndb": "porcupine", "rogue.hdb": "rogue", "scam.ndb": "scam", "shelter.ldb": "shelter",
+             "sigwhitelist.ign2": "sigwhitelist", "spamattach.hdb": "spamattach", "spamimg.hdb": "spamimg",
+             "spear.ndb": "spear", "spearl.ndb": "spearl", "sanesecurity.ftm": "ssftm",
+             "winnow.attachments.hdb": "winnow_attachments", "winnow_bad_cw.hdb": "winnow_bad_cw",
+             "winnow_extended_malware.hdb": "winnow_extended_malware",
+             "winnow_extended_malware_links.ndb": "winnow_extended_malware_links", "winnow_malware.hdb": "winnow_malware",
+             "winnow_malware_links.ndb": "winnow_malware_links",
+             "winnow_phish_complete_url.ndb": "winnow_phish_complete_url", "winnow_spam_complete.ndb": "winnow_spam_complete"}
+    off = "".join(f"url_{key} =\n" for name, key in every.items() if name not in EXTRA_SIGNATURES)
+    return (f"[DEFAULT]\ndb_url = sqlite:///{FANGFRISCH_DB}\nlocal_directory = {CLAMAV_DB}\n\n"
+            f"[sanesecurity]\nenabled = yes\nprefix = {SANESECURITY_MIRROR}\n{off}")
+
+
+def update_extra_signatures() -> str | None:
+    """Configure fangfrisch, keep it refreshing hourly, and refresh now. Returns what went wrong, or None."""
+    if not FANGFRISCH_CONF.exists() or FANGFRISCH_CONF.read_text() != fangfrisch_conf():
+        FANGFRISCH_CONF.write_text(fangfrisch_conf())
+        os.chmod(FANGFRISCH_CONF, 0o644)
+    run(["install", "-d", "-o", "clamav", "-g", "clamav", "-m", "770", str(FANGFRISCH_DB.parent)])
+    if not FANGFRISCH_DB.exists():
+        run(["runuser", "-u", "clamav", "--", "fangfrisch", "--conf", str(FANGFRISCH_CONF), "initdb"], capture_output=True)
+    run(["systemctl", "enable", "--now", "fangfrisch.timer"], capture_output=True)
+    res = run(["systemctl", "start", "fangfrisch.service"], capture_output=True, text=True)
+    if res.returncode != 0 or not (CLAMAV_DB / "badmacro.ndb").exists():
+        return "couldn't download Sanesecurity's extra signatures (see `journalctl -u fangfrisch`)"
+    return None
+
+
+def extra_signatures_check() -> tuple:
+    sigs = CLAMAV_DB / "badmacro.ndb"
+    if not sigs.exists():
+        return "warn", "Extra virus signatures aren't downloaded yet", "Update downloads Sanesecurity's", "update"
+    age = (time.time() - sigs.stat().st_mtime) / 86400
+    if age > EXTRA_SIGNATURES_MAX_AGE_DAYS:
+        return "warn", "Extra virus signatures are out of date", f"Last updated {age:.0f} days ago", "update"
+    return "ok", "Extra virus signatures are current", "Sanesecurity's malware lists"
+
+
 def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list[dict]:
     """flagged: paths already reported as password-protected, so they aren't reported twice."""
     daily = sorted(CLAMAV_DB.glob("daily.c[lv]d"))
@@ -1261,7 +1326,10 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
                                                 "scanned (a common way to smuggle malware)", encrypted=True))
         else:
             detected = True
-            out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(3)}"))
+            if m.group(3).startswith(EXTRA_SIGNATURE_PREFIXES):  # good, but less vetted than ClamAV's own
+                out.append(finding(DANGER, rel, f"flagged by Sanesecurity's extra ClamAV signatures ({m.group(3)})"))
+            else:
+                out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(3)}"))
     out += too_big_for_clamav(d, skipped)
     # Every regular file must show up exactly once. One that doesn't wasn't scanned
     # (unreadable, swapped out mid-scan, or a name the output can't represent).
@@ -2517,6 +2585,10 @@ def cmd_update(args, cfg) -> int:
     if res.returncode != 0:
         detail = (res.stderr.strip().splitlines() or ["see `journalctl -u safetorrent-apt`"])[-1]
         print(paint(f"Security updates didn't finish: {detail}", "33"))
+    print("Updating extra virus signatures…", flush=True)
+    problem = update_extra_signatures()
+    if problem:
+        print(paint(problem, "33"))
     print("Updating YARA rules…", flush=True)
     problem = update_yara_rules()
     if problem:

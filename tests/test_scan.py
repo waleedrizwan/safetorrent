@@ -304,6 +304,14 @@ class ClamAV(unittest.TestCase):
 
     def test_clean(self):
         self.assertEqual(self.scan(clam(0)), [])
+
+    def test_extra_signatures_are_suspicious_not_infected(self):
+        """Sanesecurity's lists are good but less vetted than ClamAV's own, so a hit holds the
+        download (SUSPICIOUS) rather than calling it INFECTED."""
+        out = self.scan(clam(1, self.line("files/a.docm", "Sanesecurity.Badmacro.Doc.ramf")
+                             + self.line("files/b.js", "winnow.compromised.ts.jsexploit.2")))
+        self.assertEqual([f["level"] for f in out], [st.DANGER, st.DANGER])
+        self.assertIn("Sanesecurity", out[0]["msg"])
         self.assertIn("--alert-exceeds-max=yes", self.cmd)
 
     def test_detection(self):

@@ -391,6 +391,7 @@ class Update(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
         with mock.patch.object(st, "run", side_effect=run), mock.patch.object(st, "cmd_health", return_value=0), \
                 mock.patch.object(st, "update_yara_rules", return_value=None) as yara_update, \
+                mock.patch.object(st, "update_extra_signatures", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()):
             st.cmd_update(argparse.Namespace(json=False), {})
         yara_update.assert_called_once()
