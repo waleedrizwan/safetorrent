@@ -1248,8 +1248,14 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
     key = cfg["VT_API_KEY"]
     if not key:
         return [finding(INFO, "", "VirusTotal check skipped (no VT_API_KEY in ~/.config/safetorrent/config)")]
-    rank = {"exec": 0, "macro": 1, "archive": 2, "disk": 3, "doc": 4}
+    rank = {"exec": 0, "macro": 1, "archive": 2, "disk": 3, "doc": 4, "media": 5}
     candidates = []
+    # The biggest video, song or picture too: campaigns that booby-trap media files reuse
+    # them, and one lookup is cheap. Matched by hash, so a media file never needs uploading.
+    media = [(s, r) for r, s in walk_files(d / "files") if kind_of(ext_of(r)) in MEDIA_KINDS and s > 0]
+    if media:
+        _size, rel = max(media)
+        candidates.append((rank["media"], rel, d / "files" / rel, "media"))
     for sub in ("files", "extracted"):
         root = d / sub
         if not root.exists():
@@ -1296,7 +1302,7 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
             if kind == "exec":
                 out.append(finding(WARN, rel, "program never seen by VirusTotal: new or rare, so no second opinion",
                                    unvouched=True))
-            else:
+            elif kind != "media":  # a video nobody else has is normal
                 unknown_other += 1
         else:
             stats = stats or {}
