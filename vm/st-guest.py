@@ -1286,7 +1286,9 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
     # No -i: ClamAV prints a line for every file it looked at, so every file can be
     # accounted for. A file it couldn't open just goes missing from the output.
     cmd = [
-        "clamscan", "-r", "--no-summary", "--stdout", "--scan-archive=yes",
+        # --allmatch: ClamAV stops at a file's first match, and an extra (Sanesecurity) hash can
+        # match before ClamAV's own signature, hiding it. Every match is reported instead.
+        "clamscan", "-r", "--no-summary", "--stdout", "--scan-archive=yes", "--allmatch",
         "--max-filesize=500M", "--max-scansize=2000M", "--alert-exceeds-max=yes",
         # 7z only checks files with an archive extension, 3 levels deep. ClamAV also catches a
         # locked zip renamed to .dat or nested deeper. Encrypted PDFs and Office files are common
@@ -1330,6 +1332,9 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
                 out.append(finding(DANGER, rel, f"flagged by Sanesecurity's extra ClamAV signatures ({m.group(3)})"))
             else:
                 out.append(finding(INFECTED, rel, f"ClamAV detected {m.group(3)}"))
+    # Where ClamAV's own signatures identified a file, the extra lists' hits on it add nothing.
+    identified = {f["path"] for f in out if f["level"] == INFECTED}
+    out = [f for f in out if not (f["level"] == DANGER and f["path"] in identified and "Sanesecurity" in f["msg"])]
     out += too_big_for_clamav(d, skipped)
     # Every regular file must show up exactly once. One that doesn't wasn't scanned
     # (unreadable, swapped out mid-scan, or a name the output can't represent).
