@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1025,6 +1026,32 @@ def download_progress(d: Path) -> dict | None:
             "speed": field("DL"), "eta": field("ETA")}
 
 
+DISK_RESERVE = 1024**3  # unpacking stops if the VM's free space falls below this
+DISK_POLL_SECONDS = 2
+
+
+@contextlib.contextmanager
+def disk_guard(unit: str):
+    """Stop `unit` if the VM's disk is about to fill. An archive's listing states its
+    unpacked size, but a hostile one can lie; this catches it while it unpacks.
+    Yields an Event that's set if the unit was stopped."""
+    tripped, done = threading.Event(), threading.Event()
+
+    def watch():
+        while not done.wait(DISK_POLL_SECONDS):
+            if shutil.disk_usage(QUARANTINE).free < DISK_RESERVE:
+                tripped.set()
+                stop_unit(unit)
+                return
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        yield tripped
+    finally:
+        done.set()
+        watcher.join()
+
+
 def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dict, category: str,
                      depth: int = 0) -> list[dict]:
     """Extract archives (as the torrent user) so their contents get checked too."""
@@ -1070,9 +1097,16 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
             out.append(finding(DANGER, rel, "the folder this archive unpacks into points outside quarantine "
                                             "(possible tampering)"))
             continue
-        res = run_step([sevenz, "x", "-y", NOPASS, f"-o{dest}", "--", str(src)], step_unit("7z", d.name),
-                       "RuntimeMaxSec=3600", *offline_sandbox("1G", extracted_root),
-                       capture_output=True, text=True, errors="replace")
+        unit = step_unit("7z", d.name)
+        with disk_guard(unit) as filled_disk:
+            res = run_step([sevenz, "x", "-y", NOPASS, f"-o{dest}", "--", str(src)], unit,
+                           "RuntimeMaxSec=3600", *offline_sandbox("1G", extracted_root),
+                           capture_output=True, text=True, errors="replace")
+        if filled_disk.is_set():
+            shutil.rmtree(dest, ignore_errors=True)  # the unit is stopped: nothing is writing here any more
+            out.append(finding(DANGER, rel, f"unpacking was stopped because it was filling the VM's disk, far past "
+                                            f"the {human(unpacked)} the archive claimed (possible zip bomb)"))
+            continue
         if res.returncode != 0:
             if re.search(r"Wrong password|encrypted", res.stdout + res.stderr, re.I):
                 out.append(finding(DANGER, rel, "password-protected archive: can't be scanned", encrypted=True))

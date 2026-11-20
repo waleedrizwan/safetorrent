@@ -51,6 +51,8 @@ class Fake7z:
             listing = spec.get("listing") or "".join(f"Path = {p}\nSize = {len(b)}\n\n" for p, b in files.items())
             return subprocess.CompletedProcess(cmd, 0, listing, "")
         self.extracted.append(src.name)
+        if spec.get("during"):
+            spec["during"]()
         dest = Path(next(a for a in cmd if a.startswith("-o"))[2:])
         for rel, data in files.items():
             (dest / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -102,6 +104,25 @@ class ExtractArchives(unittest.TestCase):
         out, fake = self.extract({"a.7z": {"listing": f"Size = {1 * GB}\n"}}, [("a.7z", GB)])
         self.assertEqual(self.at(out, "a.7z")[0]["level"], st.DANGER)
         self.assertEqual(fake.extracted, [])
+
+    def test_archive_that_lies_about_its_size_is_stopped(self):
+        """The listing says 7 bytes; unpacking eats the disk anyway."""
+        stopped = threading.Event()
+
+        def during():
+            st.shutil.disk_usage.return_value = Usage(0, 0, GB // 2)
+            self.assertTrue(stopped.wait(5), "the extraction was never stopped")
+        with mock.patch.object(st, "stop_unit", side_effect=lambda _unit: stopped.set()), \
+             mock.patch.object(st, "DISK_POLL_SECONDS", 0.01):
+            out, _ = self.extract({"a.zip": {"files": {"x.bin": b"7 bytes"}, "during": during}}, [("a.zip", 100)])
+        self.assertEqual(self.at(out, "a.zip")[0]["level"], st.DANGER)
+        self.assertIn("filling the VM's disk", self.at(out, "a.zip")[0]["msg"])
+        self.assertFalse((self.tmp / "extracted" / "a.zip.d").exists())
+
+    def test_ordinary_extraction_isnt_stopped(self):
+        with mock.patch.object(st, "stop_unit") as stop, mock.patch.object(st, "DISK_POLL_SECONDS", 0.01):
+            self.extract({"a.zip": {"files": {"x.txt": b"hi"}, "during": lambda: st.time.sleep(0.1)}}, [("a.zip", 100)])
+        stop.assert_not_called()
 
     def test_only_first_volume_of_multipart(self):
         names = ["m.part1.rar", "m.part2.rar", "m.part10.rar", "old.rar", "old.r00", "old.r01",
