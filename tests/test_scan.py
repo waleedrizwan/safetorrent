@@ -22,6 +22,10 @@ PE = b"MZ\x90\x00" + b"\x00" * 60
 class Fake7z:
     """Each archive (by file name) maps to its contents, or to a canned listing/exit code."""
 
+    @staticmethod
+    def assertIn(item, seq):
+        assert item in seq, (item, seq)
+
     def __init__(self, archives: dict):
         self.archives = archives
         self.extracted: list[str] = []
@@ -34,11 +38,12 @@ class Fake7z:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[:4] == ["runuser", "-u", "torrent", "--"]:
             cmd = cmd[4:]
+        if cmd[0] == "systemd-run":
+            self.assertIn("User=torrent", cmd)
+            cmd = cmd[cmd.index("--") + 1:]
         if cmd[0] == "mkdir":
             Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        if cmd[0] == "timeout":
-            cmd = cmd[2:]
         src = Path(cmd[-1])
         spec = self.archives[src.name]
         files = spec.get("files", {})
@@ -152,9 +157,21 @@ class ExtractArchives(unittest.TestCase):
         inside = str(self.tmp / "extracted")
         for cmd in fake.commands:
             if any(a.startswith(inside) for a in cmd if not a.startswith("-o")):
-                self.assertEqual(cmd[:4], ["runuser", "-u", "torrent", "--"], cmd)
+                as_torrent = cmd[:4] == ["runuser", "-u", "torrent", "--"] or (
+                    cmd[0] == "systemd-run" and "User=torrent" in cmd)
+                self.assertTrue(as_torrent, cmd)
         mkdirs = [c for c in fake.commands if "mkdir" in c]
         self.assertEqual(len(mkdirs), 3)
+
+    def test_7z_runs_in_a_unit_that_kills_its_leftovers(self):
+        _out, fake = self.extract({"a.zip": {"files": {"x.txt": b"x"}}}, [("a.zip", 100)])
+        sevenz = [c for c in fake.commands if "/usr/bin/7z" in c]
+        self.assertEqual(len(sevenz), 2)  # list, then extract
+        for cmd in sevenz:
+            self.assertEqual(cmd[0], "systemd-run")
+            self.assertIn("KillMode=control-group", cmd)
+            self.assertTrue(any(a.startswith(f"--unit=st-step-7z-{self.tmp.name}-") for a in cmd), cmd)
+        self.assertIn("RuntimeMaxSec=3600", sevenz[1])
 
     def test_planted_symlink_at_unpack_target_is_danger(self):
         victim = self.tmp / "victim"

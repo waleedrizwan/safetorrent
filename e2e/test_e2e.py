@@ -259,6 +259,14 @@ class LocalTorrents(unittest.TestCase):
             self.assertIn("safetorrent", attr.stdout, f"{rel} has no Gatekeeper quarantine flag")
         self.assertEqual(item(meta["id"])["status"], "released")
 
+    def test_nothing_runs_as_torrent_after_a_download(self):
+        """Every step runs in a unit that systemd tears down, so nothing can keep writing after the scan."""
+        self.run_fixture("st-e2e-clean-clip")
+        left = vm("pgrep -a -u torrent", check=False)
+        self.assertEqual(left.returncode, 1, f"still running as torrent:\n{left.stdout}")
+        units = vm("systemctl list-units --plain --no-legend 'st-step-*'").stdout.strip()
+        self.assertEqual(units, "", units)
+
     def test_eicar_is_infected_and_kept(self):
         meta = self.run_fixture("st-e2e-eicar-notes")
         self.assertEqual(meta["precheck"]["verdict"], "OK")

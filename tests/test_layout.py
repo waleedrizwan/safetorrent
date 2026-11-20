@@ -103,13 +103,31 @@ class FakeAria2:
         return self.rc
 
 
+class StillRunning(FakeAria2):
+    """aria2 that never finishes by itself, so the watchdog has to stop it."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.stopped = False
+
+    def wait(self, timeout=None):
+        if not self.stopped:
+            raise subprocess.TimeoutExpired("aria2c", timeout)
+        return 143
+
+    def poll(self):
+        return 143 if self.stopped else None
+
+
 class Download(Base):
-    def download(self, rc):
+    def download(self, rc, proc=None, cfg=None):
         d = self.quarantine / "abcdef0123"
-        (d / "files").mkdir(parents=True)
+        (d / "files").mkdir(parents=True, exist_ok=True)
         meta = {"id": "abcdef0123", "total": 10, "status": "prechecked"}
-        with mock.patch.object(st.subprocess, "Popen", return_value=FakeAria2(rc)):
-            st.download(d, meta, dict(st.DEFAULTS), background=True)
+        with mock.patch.object(st.subprocess, "Popen", return_value=proc or FakeAria2(rc)) as popen:
+            st.download(d, meta, cfg or dict(st.DEFAULTS), background=True)
+        self.argv = popen.call_args.args[0]
+        self.unit = next(a for a in self.argv if a.startswith("--unit="))[len("--unit="):]
         return [c for c in self.commands() if c[0] == "chown"]
 
     def test_finished_files_are_locked_before_the_scan(self):
@@ -119,6 +137,43 @@ class Download(Base):
 
     def test_unfinished_files_stay_writable_for_resume(self):
         self.assertEqual([c[-2] for c in self.download(1)], ["torrent:torrent"])
+
+    def test_aria2_runs_in_a_killable_unit(self):
+        """runuser leaves a setsid() child running; a unit's cgroup doesn't."""
+        self.download(0)
+        self.assertEqual(self.argv[0], "systemd-run")
+        self.assertIn("KillMode=control-group", self.argv)
+        self.assertIn("User=torrent", self.argv)
+        self.assertTrue(self.unit.startswith("st-step-aria2-abcdef0123-"), self.unit)
+        self.assertEqual(self.argv[self.argv.index("--") + 1], "aria2c")
+
+    def test_unit_is_stopped_before_files_are_locked(self):
+        for rc in (0, 1):
+            with self.subTest(rc=rc):
+                self.run.reset_mock()
+                self.download(rc)
+                cmds = self.commands()
+                stop = cmds.index(["systemctl", "stop", self.unit])
+                if rc == 0:
+                    self.assertLess(stop, cmds.index(["chown", "-R", "--no-dereference", "root:root",
+                                                      str(self.quarantine / "abcdef0123" / "files")]))
+
+    def test_pause_signals_the_unit_not_a_pid(self):
+        proc = StillRunning()
+
+        def run(cmd, **kw):
+            if cmd[:2] == ["systemctl", "kill"]:
+                proc.stopped = True
+            return ok(cmd)
+        self.run.side_effect = run
+        with mock.patch.object(st, "vpn_healthy", return_value=None), \
+                mock.patch.object(st.os, "killpg") as killpg, mock.patch.object(st, "save_meta"):
+            self.download(None, proc=proc, cfg=dict(st.DEFAULTS, USE_VPN="yes"))
+        cmds = self.commands()
+        self.assertIn(["systemctl", "kill", "--signal=SIGTERM", self.unit], cmds)
+        self.assertLess(cmds.index(["systemctl", "kill", "--signal=SIGTERM", self.unit]),
+                        cmds.index(["systemctl", "stop", self.unit]))
+        killpg.assert_not_called()
 
 
 class SecureLayout(Base):

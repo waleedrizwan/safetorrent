@@ -228,6 +228,39 @@ class ReleaseState(Base):
         self.assertEqual(self.scan(), "scanned")
 
 
+class StepUnits(unittest.TestCase):
+    def test_step_units_are_not_items(self):
+        out = "st-abcdef0123.service loaded active running x\nst-step-7z-abcdef0123-1a2b3c4d.service loaded active running y\n"
+        with mock.patch.object(st, "run", return_value=subprocess.CompletedProcess([], 0, out, "")):
+            self.assertEqual(st.active_units(), {"abcdef0123"})
+
+    def test_interrupted_step_stops_its_unit(self):
+        """Ctrl-C or `safetorrent stop` kills systemd-run, but the unit would keep going."""
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[0] == "systemd-run":
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(st, "run", side_effect=run), self.assertRaises(KeyboardInterrupt):
+            st.run_step(["7z", "x", "a.zip"], "st-step-7z-abcdef0123-00000000")
+        self.assertEqual(calls[-1], ["systemctl", "stop", "st-step-7z-abcdef0123-00000000"])
+
+    def test_stop_and_purge_stop_the_items_steps(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        calls = []
+        with mock.patch.object(st, "QUARANTINE", d), \
+                mock.patch.object(st, "run", side_effect=lambda cmd, **kw: calls.append(cmd)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            (d / ID).mkdir()
+            st.save_meta(d / ID, {"id": ID, "status": "scanned"})
+            st.cmd_stop(argparse.Namespace(id=ID, json=True), {})
+            st.cmd_purge(argparse.Namespace(id=ID, json=True), {})
+        self.assertEqual(calls.count(["systemctl", "stop", f"st-step-*-{ID}-*"]), 2)
+
+
 class SpecialFiles(Base):
     def test_symlink_in_files_is_danger(self):
         """walk_files skips symlinks, so nothing would scan one, yet it would be copied to the Mac."""

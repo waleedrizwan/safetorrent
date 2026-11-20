@@ -24,6 +24,7 @@ import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -407,7 +408,42 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 
 def as_torrent_user(cmd: list[str]) -> list[str]:
+    """For short commands that don't read untrusted data. Anything that does goes
+    through run_step(), so nothing it starts can outlive it."""
     return ["runuser", "-u", TORRENT_USER, "--"] + cmd
+
+
+STEP_PREFIX = "st-step-"  # not items: active_units() leaves these out
+
+
+def step_unit(kind: str, item_id: str = "") -> str:
+    return f"{STEP_PREFIX}{kind}-{item_id + '-' if item_id else ''}{secrets.token_hex(4)}"
+
+
+def torrent_unit(cmd: list[str], unit: str, *props: str, pty: bool = False) -> list[str]:
+    """cmd as the torrent user, in a throwaway systemd unit. runuser leaves a forked or
+    setsid() child running (one could keep a scanned file open for writing); when a
+    unit ends, systemd kills everything in its cgroup."""
+    return ["systemd-run", "--wait", "--pty" if pty else "--pipe", "--collect", "--quiet", f"--unit={unit}",
+            "-p", f"User={TORRENT_USER}", "-p", f"Group={TORRENT_USER}", "-p", "KillMode=control-group",
+            *[a for p in props for a in ("-p", p)], "--", *cmd]
+
+
+def stop_unit(unit: str) -> None:
+    run(["systemctl", "stop", unit], capture_output=True)
+
+
+def run_step(cmd: list[str], unit: str, *props: str, **kw) -> subprocess.CompletedProcess:
+    try:
+        return run(torrent_unit(cmd, unit, *props), **kw)
+    except BaseException:  # e.g. Ctrl-C or `safetorrent stop`: systemd-run is gone, the unit isn't
+        stop_unit(unit)
+        raise
+
+
+def stop_steps(item_id: str) -> None:
+    """Everything still running as the torrent user for this item."""
+    run(["systemctl", "stop", f"{STEP_PREFIX}*-{item_id}-*"], capture_output=True)
 
 
 class StError(Exception):
@@ -794,12 +830,12 @@ def obtain_torrent(src: Path, cfg: dict) -> bytes:
         shutil.chown(tmp, TORRENT_USER, TORRENT_USER)
         print("Fetching the torrent's file list from peers (nothing is downloaded yet)…", flush=True)
         timeout = cfg["METADATA_TIMEOUT_SECONDS"]
-        run(as_torrent_user([
-            "timeout", timeout, "aria2c", "--bt-metadata-only=true", "--bt-save-metadata=true",
+        run_step([
+            "aria2c", "--bt-metadata-only=true", "--bt-save-metadata=true",
             f"--dir={tmp}", "--enable-dht=true", f"--dht-file-path={TORRENT_HOME / 'dht.dat'}",
             f"--dht-entry-point={DHT_BOOTSTRAP}", "--bt-enable-lpd=false",
             "--console-log-level=error", "--summary-interval=0", "--quiet=true", magnet,
-        ]))
+        ], step_unit("metadata"), f"RuntimeMaxSec={timeout}")
         found = sorted(tmp.glob("*.torrent"))
         if not found:
             die(f"couldn't get the torrent's file list within {timeout}s. The torrent may be dead "
@@ -832,7 +868,8 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
     claim(meta)
     save_meta(d, meta)
     log = d / "aria2.log"
-    cmd = as_torrent_user([
+    unit = step_unit("aria2", meta["id"])
+    cmd = torrent_unit([
         "aria2c", f"--dir={files_dir}", f"--seed-time={cfg['SEED_MINUTES']}",
         f"--bt-stop-timeout={int(cfg['STALL_TIMEOUT_MINUTES']) * 60}",
         "--file-allocation=none", f"--check-integrity={str(resuming).lower()}", "--bt-enable-lpd=false",
@@ -842,10 +879,9 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
         f"--summary-interval={2 if background else 0}",
         f"--show-console-readout={'false' if background else 'true'}",
         str(d / "source.torrent"),
-    ])
+    ], unit, pty=not background and sys.stdout.isatty())  # a pty keeps aria2's live readout
     out = open(log, "w") if background else None
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT if out else None,
-                            start_new_session=background)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT if out else None)
     ok, reason = False, None
     try:
         while True:
@@ -859,12 +895,18 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
     except KeyboardInterrupt:
         reason = "Stopped."
     if proc.poll() is None:
-        stop = (lambda sig: os.killpg(proc.pid, sig)) if background else proc.send_signal
-        stop(signal.SIGTERM)  # aria2c saves its resume state on SIGTERM
+        # aria2c saves its resume state on SIGTERM.
+        run(["systemctl", "kill", "--signal=SIGTERM", unit], capture_output=True)
         try:
             proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            stop(signal.SIGKILL)
+            pass
+    # Always, even when aria2 exited by itself: kills anything it left behind, so
+    # nothing can hold a file open for writing once files/ is locked below.
+    stop_unit(unit)
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
     if out:
         out.close()
     if ok:
@@ -932,8 +974,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
             die("7-Zip isn't installed in the VM, so archives can't be checked; run `safetorrent setup`")
         src = root / rel
         dest = extracted_root / (rel + ".d") if depth == 0 else src.parent / (src.name + ".d")
-        listing = run(as_torrent_user([sevenz, "l", "-slt", NOPASS, "--", str(src)]),
-                      capture_output=True, text=True, errors="replace")
+        listing = run_step([sevenz, "l", "-slt", NOPASS, "--", str(src)], step_unit("7z", d.name),
+                           capture_output=True, text=True, errors="replace")
         text = listing.stdout + listing.stderr
         if re.search(r"Wrong password|Encrypted = \+|Can not open encrypted", text):
             out.append(finding(DANGER, rel, "password-protected archive: can't be scanned (a common way to smuggle malware)",
@@ -955,8 +997,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
             out.append(finding(DANGER, rel, "the folder this archive unpacks into points outside quarantine "
                                             "(possible tampering)"))
             continue
-        res = run(as_torrent_user(["timeout", "3600", sevenz, "x", "-y", NOPASS, f"-o{dest}", "--", str(src)]),
-                  capture_output=True, text=True, errors="replace")
+        res = run_step([sevenz, "x", "-y", NOPASS, f"-o{dest}", "--", str(src)], step_unit("7z", d.name),
+                       "RuntimeMaxSec=3600", capture_output=True, text=True, errors="replace")
         if res.returncode != 0:
             if re.search(r"Wrong password|encrypted", res.stdout + res.stderr, re.I):
                 out.append(finding(DANGER, rel, "password-protected archive: can't be scanned", encrypted=True))
@@ -1022,7 +1064,7 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
     roots = [p for p in (d / "files", d / "extracted") if p.exists()]
     # No -i: ClamAV prints a line for every file it looked at, so every file can be
     # accounted for. A file it couldn't open just goes missing from the output.
-    cmd = as_torrent_user([
+    cmd = [
         "clamscan", "-r", "--no-summary", "--stdout", "--scan-archive=yes",
         "--max-filesize=500M", "--max-scansize=2000M", "--alert-exceeds-max=yes",
         # 7z only checks files with an archive extension, 3 levels deep. ClamAV also catches a
@@ -1030,9 +1072,9 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
         # and harmless, so those aren't flagged.
         "--alert-encrypted-archive=yes", "--alert-encrypted-doc=no",
         *map(str, roots),
-    ])
+    ]
     with scan_lock(on_wait):
-        res = run(cmd, capture_output=True, text=True, errors="replace")
+        res = run_step(cmd, step_unit("clamav", d.name), capture_output=True, text=True, errors="replace")
     skipped: list[str] = []
     detected = False
     reported: collections.Counter[str] = collections.Counter()
@@ -1350,7 +1392,8 @@ def is_running(meta: dict, units: set[str]) -> bool:
 def active_units() -> set[str]:
     res = run(["systemctl", "list-units", "--type=service", "--state=active,activating", "--plain",
                "--no-legend", "st-*"], capture_output=True, text=True)
-    return {line.split()[0][3:].removesuffix(".service") for line in res.stdout.splitlines() if line.strip()}
+    names = [line.split()[0] for line in res.stdout.splitlines() if line.strip()]
+    return {n[3:].removesuffix(".service") for n in names if not n.startswith(STEP_PREFIX)}
 
 
 def item_view(d: Path, running: set[str]) -> dict:
@@ -1479,6 +1522,7 @@ def cmd_stop(args, cfg) -> int:
     d = item_dir(args.id)
     meta = load_meta(d)
     run(["systemctl", "stop", unit_name(meta["id"])], capture_output=True)
+    stop_steps(meta["id"])
     if meta["status"] in BUSY and worker_alive(meta):  # running from a terminal, not systemd
         os.kill(meta["worker"]["pid"], signal.SIGTERM)  # it stops aria2 and saves its state
         for _ in range(60):
@@ -1620,6 +1664,7 @@ def cmd_purge(args, cfg) -> int:
     targets = [p.parent for p in QUARANTINE.glob("*/meta.json")] if args.id == "all" else [item_dir(args.id)]
     for d in targets:
         run(["systemctl", "stop", unit_name(d.name)], capture_output=True)
+        stop_steps(d.name)
         shutil.rmtree(d)
         if not args.json:
             print(f"removed {d.name}")
