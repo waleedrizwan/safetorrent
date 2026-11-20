@@ -154,6 +154,31 @@ def download_dir() -> Path:
     return Path(os.path.expanduser(raw))
 
 
+def download_dir_problem(d: Path) -> str | None:
+    """Why clean downloads can't be copied to `d` right now, or None if they can."""
+    if not d.is_absolute():
+        return f"The folder must be a full path, not {d}."
+    parts = d.parts
+    if len(parts) >= 3 and parts[1] == "Volumes" and not Path("/Volumes", parts[2]).is_dir():
+        return f"The drive {parts[2]} isn't connected."
+    existing = d
+    while not existing.exists():
+        existing = existing.parent
+    if not existing.is_dir() or not os.access(existing, os.W_OK | os.X_OK):
+        return f"{existing} can't be written to."
+    return None
+
+
+def download_dir_check() -> dict:
+    d = download_dir()
+    problem = download_dir_problem(d)
+    if problem:
+        return {"id": "download_dir", "state": "warn", "title": "Download folder isn't available",
+                "detail": problem + " Clean downloads stay in the VM until it is.", "fix": "settings"}
+    return {"id": "download_dir", "state": "ok", "title": "Download folder is ready",
+            "detail": str(d), "fix": None}
+
+
 # ---------------------------------------------------------------- shared state + workers
 
 
@@ -363,9 +388,12 @@ def background(key: str, label: str, fn, *args) -> None:
 
 
 def api_state(_body) -> dict:
+    # Checked on every poll (it's a few stat calls), so plugging a drive in shows at once.
+    folder = download_dir_check()
     with State.lock:
+        health = State.health and {**State.health, "checks": [*State.health["checks"], folder]}
         return {
-            "vm": State.vm, "health": State.health, "health_error": State.health_error,
+            "vm": State.vm, "health": health, "health_error": State.health_error,
             "items": State.items, "free": State.free, "items_error": State.items_error,
             "busy": dict(State.busy), "errors": dict(State.release_errors), "settings": public_settings(),
         }
@@ -520,6 +548,9 @@ def api_vm_start(_body) -> dict:
 
 def api_open_downloads(_body) -> dict:
     d = download_dir()
+    problem = download_dir_problem(d)
+    if problem:
+        raise ApiError(problem)
     d.mkdir(parents=True, exist_ok=True)
     subprocess.run(["open", str(d)])
     return {"ok": True}
