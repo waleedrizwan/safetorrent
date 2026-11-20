@@ -1,5 +1,7 @@
 """Pure-logic tests for the VM agent: progress parsing, firewall checks,
 VirusTotal verdicts, stale-state recovery, folder names. Run anywhere."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -276,6 +278,55 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(st.disk_check(2 * gb)[0], "block")
         self.assertEqual(st.disk_check(10 * gb)[0], "warn")
         self.assertEqual(st.disk_check(50 * gb)[0], "ok")
+
+
+class TerminalOutput(unittest.TestCase):
+    """Torrent names and paths are printed in the Mac's terminal before you decide to
+    download. StringIO isn't a TTY, so paint() adds no escapes: any in the output came
+    from the torrent."""
+    BAD = ("\x1b", "\x07", "\x9b", "\x90")
+
+    def printed(self, fn, *args) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fn(*args)
+        return out.getvalue()
+
+    def assertClean(self, out):
+        for c in self.BAD:
+            self.assertNotIn(c, out)
+
+    def test_findings_cant_inject_escape_sequences(self):
+        out = self.printed(st.print_findings, [st.finding(st.DANGER, "\x1b]52;c;ZWNobyBo\x07a.mkv", "x\x1b[2J\x9b")])
+        self.assertClean(out)
+        self.assertIn("a.mkv", out)
+
+    def test_names_cant_fake_extra_lines(self):
+        out = self.printed(st.print_findings, [st.finding(st.WARN, "a\nPre-download check: OK", "m")])
+        self.assertEqual(out.count("\n"), 1)
+
+    def test_report_and_list_names_are_neutralised(self):
+        meta = {"id": "abcdef0123", "name": "\x1b[1;32mCLEAN\x1b[0m", "total": 10, "file_count": 1,
+                "category": "media", "status": "scanned", "added": "2026", "released_to": "/x\x1b]0;t\x07",
+                "error": "e\x1b[2K", "precheck": {"verdict": "OK", "findings": []},
+                "scan": {"verdict": "CLEAN", "findings": [st.finding(st.INFO, "\x1bP", "\x1b[8m")]}}
+        self.assertClean(self.printed(st.print_report, meta))
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / meta["id"]).mkdir()
+        st.save_meta(tmp / meta["id"], meta)
+        with mock.patch.object(st, "QUARANTINE", tmp), mock.patch.object(st, "active_units", return_value=set()):
+            out = self.printed(st.cmd_list, None, {})
+        self.assertIn("CLEAN", out)
+        self.assertClean(out)
+
+    def test_bidi_is_made_visible(self):
+        self.assertIn("<U+202E>", st.shown("photo‮gpj.exe"))
+
+    def test_ordinary_unicode_names_unchanged(self):
+        name = "Amélie (2001) 日本語 🎬"
+        self.assertEqual(st.shown(name), name)
+        self.assertIn(name, self.printed(st.print_findings, [st.finding(st.INFO, name, "ok")]))
 
 
 if __name__ == "__main__":

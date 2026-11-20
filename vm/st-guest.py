@@ -373,6 +373,16 @@ def human(n: float) -> str:
     return f"{n} B"
 
 
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def shown(s) -> str:
+    """Torrent-controlled text, safe to print in a terminal: no escape sequences (they
+    could repaint a REJECTED report as OK, or set the clipboard), no line breaks to fake
+    extra lines, and right-to-left tricks made visible. paint() adds the only escapes."""
+    return CTRL_RE.sub("?", BIDI_RE.sub(lambda m: f"<U+{ord(m.group()):04X}>", str(s)))
+
+
 def paint(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
 
@@ -388,8 +398,8 @@ def print_findings(findings: list[dict], limit: int = 40) -> None:
     ordered = sorted(findings, key=lambda f: -f["level"])
     for f in ordered[:limit]:
         icon, code = LEVEL_ICON[f["level"]]
-        where = f"{f['path']}: " if f["path"] else ""
-        print(f"  {paint(icon, code)} {where}{f['msg']}")
+        where = f"{shown(f['path'])}: " if f["path"] else ""
+        print(f"  {paint(icon, code)} {where}{shown(f['msg'])}")
     if len(ordered) > limit:
         print(f"  … and {len(ordered) - limit} more (see `safetorrent report`)")
 
@@ -1294,12 +1304,12 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
 
 
 def print_report(meta: dict) -> None:
-    print(f"\n{paint(meta['name'], '1')}  [{meta['id']}]")
+    print(f"\n{paint(shown(meta['name']), '1')}  [{meta['id']}]")
     print(f"  {human(meta['total'])}, {meta['file_count']} file(s), category: {meta['category']}, status: {meta['status']}")
     if meta.get("released_to"):
-        print(f"  released to: {meta['released_to']}")
+        print(f"  released to: {shown(meta['released_to'])}")
     if meta.get("error"):
-        print(paint(f"  {meta['error']}", "33"))
+        print(paint(f"  {shown(meta['error'])}", "33"))
     scan_ = meta.get("scan")
     if scan_:
         v = scan_["verdict"]
@@ -1429,11 +1439,11 @@ def cmd_get(args, cfg) -> int:
             print(f"Resume it with: safetorrent resume {meta['id']}")
         return 0
 
-    print(f"\n{paint(info['name'], '1')}  [{meta['id']}]")
+    print(f"\n{paint(shown(info['name']), '1')}  [{meta['id']}]")
     auto = "" if args.category else " (auto-detected; override with --category)"
     print(f"  {human(info['total'])} in {len(info['files'])} file(s), category: {meta['category']}{auto}")
     for f in meta["files"][:12]:
-        print(f"    {human(f['size']):>9}  {f['path']}")
+        print(f"    {human(f['size']):>9}  {shown(f['path'])}")
     if len(info["files"]) > 12:
         print(f"    … and {len(info['files']) - 12} more")
     v = meta["precheck"]["verdict"]
@@ -1623,7 +1633,7 @@ def cmd_list(args, cfg) -> int:
     print(f"{'ID':<11} {'RESULT':<11} {'STATUS':<12} {'SIZE':>9}  NAME")
     for m in items:
         v = (m.get("scan") or {}).get("verdict") or m["precheck"]["verdict"]
-        print(f"{m['id']:<11} {paint(f'{v:<11}', VERDICT_COLOR[v])} {m['status']:<12} {human(m['total']):>9}  {m['name']}")
+        print(f"{m['id']:<11} {paint(f'{v:<11}', VERDICT_COLOR[v])} {m['status']:<12} {human(m['total']):>9}  {shown(m['name'])}")
     print(f"\nVM free space: {human(shutil.disk_usage(QUARANTINE).free)}")
     return 0
 
