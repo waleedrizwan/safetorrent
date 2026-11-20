@@ -125,6 +125,13 @@ class NameRules(unittest.TestCase):
     def test_app_bundle_contents_are_programs(self):
         self.assertEqual(st.kind_of(st.ext_of("X.app/Contents/Info.plist")), "exec")
 
+    def test_other_bundle_contents_are_programs(self):
+        for path in ("X.framework/Versions/A/X", "Disk.sparsebundle/bands/0", "Inst.pkg/Contents/Archive.pax.gz",
+                     "a/Preview.qlgenerator/Contents/Info.plist"):
+            with self.subTest(path):
+                self.assertEqual(st.kind_of(st.ext_of(path)), "exec")
+        self.assertEqual(st.ext_of("Show.2024/ep1.mkv"), "mkv")  # a dot in a folder name isn't a bundle
+
 
 class Sniff(unittest.TestCase):
     def test_disguised_pe(self):
@@ -167,6 +174,20 @@ class MacAndWindowsTricks(unittest.TestCase):
                     "plugin", "fileloc", "action"):
             with self.subTest(ext):
                 self.assertEqual(self.level(f"Movie/extra.{ext}"), st.DANGER)
+
+    def test_more_mac_types_in_a_movie(self):
+        for ext in ("shortcut", "sparseimage", "framework", "appex"):
+            with self.subTest(ext):
+                self.assertEqual(self.level(f"Movie/extra.{ext}"), st.DANGER)
+
+    def test_configuration_profiles_are_dangerous_even_in_software(self):
+        self.assertEqual(self.level("Tool/settings.mobileconfig", "software"), st.DANGER)
+
+    def test_mac_archive_formats_are_archives(self):
+        for ext in ("aar", "yaa", "xip", "cpgz", "cpio", "pax"):
+            with self.subTest(ext):
+                self.assertEqual(st.kind_of(ext), "archive")
+                self.assertEqual(self.level(f"Movie/extra.{ext}"), st.WARN)
 
     def test_windows_extras(self):
         for ext in ("msc", "chm", "application", "settingcontent-ms", "appref-ms"):
