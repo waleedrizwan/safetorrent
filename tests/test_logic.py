@@ -368,6 +368,101 @@ class ExtraSignatures(unittest.TestCase):
             self.assertNotIn(kept, off)
 
 
+class AiReview(unittest.TestCase):
+    """The opt-in Claude review, against a stand-in for the API."""
+
+    CFG = {"AI_REVIEW": "yes", "ANTHROPIC_API_KEY": "sk-test"}
+
+    def review(self, answer=None, cfg=None, error=None, files=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            files = files or {"Film/film.mkv": b"\x1a\x45\xdf\xa3", "Film/Codec.exe": b"MZ\x90\x00 steal wallet.dat now"}
+            for rel, data in files.items():
+                (d / "files" / rel).parent.mkdir(parents=True, exist_ok=True)
+                (d / "files" / rel).write_bytes(data)
+            meta = {"name": "Film 2024 1080p", "category": "media", "total": 99, "file_count": len(files),
+                    "files": [{"path": r, "size": len(b)} for r, b in files.items()]}
+            findings = [st.finding(st.DANGER, "Film/Codec.exe", "a program inside a media torrent")]
+            sent = []
+
+            class Reply(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            def urlopen(req, timeout):
+                sent.append(req)
+                if error:
+                    raise error
+                return Reply(json.dumps(answer).encode())
+            with mock.patch.object(st.urllib.request, "urlopen", side_effect=urlopen):
+                out = st.ai_review(meta, findings, d, self.CFG if cfg is None else cfg)
+            return out, sent, findings
+
+    @staticmethod
+    def answer(concerns, stop="end_turn"):
+        return {"stop_reason": stop, "content": [{"type": "thinking", "thinking": ""},
+                                                 {"type": "text", "text": json.dumps({"concerns": concerns})}]}
+
+    def test_off_unless_turned_on_with_a_key(self):
+        for cfg in ({}, {"AI_REVIEW": "yes"}, {"AI_REVIEW": "no", "ANTHROPIC_API_KEY": "sk"}, dict(st.DEFAULTS)):
+            out, sent, _ = self.review(self.answer([]), cfg=cfg)
+            self.assertEqual((out, sent), ([], []), cfg)
+
+    def test_request(self):
+        _, sent, _ = self.review(self.answer([]))
+        req = sent[0]
+        body = json.loads(req.data)
+        self.assertEqual(req.full_url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(req.get_header("X-api-key"), "sk-test")
+        self.assertEqual(req.get_header("Anthropic-version"), "2026-10-21")
+        self.assertEqual(req.get_header("Anthropic-beta"), "server-side-fallback-2026-07-01")
+        self.assertEqual(body["model"], "claude-opus-5-5")
+        self.assertEqual(body["fallbacks"], "default")
+        self.assertEqual(body["output_config"]["effort"], "high")
+        self.assertEqual(body["output_config"]["format"]["schema"]["additionalProperties"], False)
+        for absent in ("thinking", "temperature", "top_p"):
+            self.assertNotIn(absent, body)
+        data = body["messages"][0]["content"]
+        self.assertTrue(data.startswith("<scan_data>") and data.endswith("</scan_data>"))
+        sent_data = json.loads(data[len("<scan_data>"):-len("</scan_data>")])
+        self.assertEqual(sent_data["programs"][0]["path"], "Film/Codec.exe")
+        self.assertIn(" steal wallet.dat now", sent_data["programs"][0]["strings_sample"])
+        self.assertEqual(sent_data["findings"][0]["level"], "danger")
+
+    def test_concerns_become_warnings_or_dangers(self):
+        out, _, findings = self.review(self.answer([
+            {"path": "Film/Codec.exe", "severity": "danger", "reason": "reads crypto wallet files"},
+            {"path": "/etc/passwd", "severity": "warning", "reason": "made-up path"}]))
+        self.assertEqual([(f["level"], f["path"]) for f in out], [(st.DANGER, "Film/Codec.exe"), (st.WARN, "")])
+        self.assertTrue(out[0]["msg"].startswith("AI review: "))
+        self.assertEqual(findings[0]["level"], st.DANGER)  # what the scan found is never touched
+
+    def test_it_can_never_clear_anything(self):
+        out, _, findings = self.review(self.answer([]))
+        self.assertEqual([f["level"] for f in out], [st.INFO])
+        self.assertEqual(st.max_level(findings + out), st.DANGER)
+
+    def test_capped_and_trimmed(self):
+        many = [{"path": "", "severity": "warning", "reason": "x" * 5000}] * 30
+        out, _, _ = self.review(self.answer(many))
+        self.assertEqual(len(out), st.AI_MAX_CONCERNS)
+        self.assertLessEqual(len(out[0]["msg"]), 420)
+
+    def test_failures_are_informational_never_blocking(self):
+        cases = [(self.answer([], stop="refusal"), None, "didn't finish (refusal)"),
+                 ({"stop_reason": "end_turn", "content": [{"type": "text", "text": "not json"}]}, None, "couldn't be read"),
+                 (None, st.urllib.error.HTTPError("u", 529, "overloaded", {}, None), "answered 529"),
+                 (None, st.urllib.error.URLError("no network"), "didn't run")]
+        for answer, error, words in cases:
+            with self.subTest(words):
+                out, _, _ = self.review(answer, error=error)
+                self.assertEqual([f["level"] for f in out], [st.INFO])
+                self.assertIn(words, out[0]["msg"])
+
+
 class Verdicts(unittest.TestCase):
     def test_worst_finding_wins(self):
         f = [st.finding(st.INFO, "", "a"), st.finding(st.WARN, "", "b"), st.finding(st.INFECTED, "", "c")]

@@ -28,3 +28,11 @@ MAX_EXTRACT_GB=50
 # anything hidden in them: fonts and attachments, metadata, scripts. The copies you get
 # then aren't byte-identical to the torrent's. Never done when you give --sha256.
 DISARM_MEDIA=yes
+
+# Ask Claude to look over each scan's results for things no single check catches (a
+# "film" that's really a small program, a keygen beside a crack). It can only add
+# warnings, never clear anything. Off by default: each scan sends the file list, the
+# findings and readable text from programs to Anthropic, and costs a few cents.
+# Needs an API key from https://platform.claude.com.
+AI_REVIEW=no
+ANTHROPIC_API_KEY=
