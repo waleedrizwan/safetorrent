@@ -194,6 +194,7 @@ STATUSES = {"prechecked", "rejected", "skipped", "queued", "downloading", "incom
             "blocked", "downloaded", "scanning", "scanned", "released", "broken"}
 PRE_VERDICTS = {"OK", "WARNING", "REJECTED"}
 SCAN_VERDICTS = {"CLEAN", "WARNING", "SUSPICIOUS", "INFECTED"}
+RELEASE_VERDICTS = SCAN_VERDICTS | {"UNSCANNED", "-"}
 
 
 def count(v) -> int:
@@ -234,6 +235,8 @@ def sanitize_item(m) -> dict | None:
         # An unknown verdict is never treated as clean.
         m["scan"] = {**scan, "verdict": scan.get("verdict") if scan.get("verdict") in SCAN_VERDICTS else "SUSPICIOUS",
                      "findings": clean_findings(scan.get("findings"))}
+    if "release_verdict" in m:  # older agents don't send it; the page then goes by the scan verdict
+        m["release_verdict"] = m["release_verdict"] if m["release_verdict"] in RELEASE_VERDICTS else "SUSPICIOUS"
     m["auto_release"] = m.get("auto_release") is not False
     return m
 

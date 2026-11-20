@@ -410,6 +410,12 @@ class UntrustedItems(ServerBase):
         self.assertEqual(m["scan"]["findings"], [{"level": 3, "path": "1", "msg": ""}])
         self.assertEqual(self.srv.State.free, 0)
 
+    def test_release_verdict_is_checked_too(self):
+        base = {"id": self.ID, "status": "scanned"}
+        self.assertEqual(self.srv.sanitize_item(dict(base, release_verdict="UNSCANNED"))["release_verdict"], "UNSCANNED")
+        self.assertEqual(self.srv.sanitize_item(dict(base, release_verdict="<b>"))["release_verdict"], "SUSPICIOUS")
+        self.assertNotIn("release_verdict", self.srv.sanitize_item(base))
+
     def test_ordinary_items_pass_through(self):
         item = {"id": self.ID, "name": "Show", "status": "scanned", "total": 1000, "file_count": 2,
                 "files": [{"path": "Show/a.mkv", "size": 900}], "auto_release": True,
@@ -420,6 +426,32 @@ class UntrustedItems(ServerBase):
 
 @unittest.skipUnless(os.path.exists(CHROME), "needs Google Chrome for the browser check")
 class HostileNamesInBrowser(ServerBase):
+    def test_unscanned_item_offers_only_copy_anyway(self):
+        state = hostile_state()
+        item = dict(state["items"][0], name="Tool", release_verdict="UNSCANNED")
+        state["items"] = [item]
+        self.srv.ROUTES[("GET", "/api/state")] = lambda _body: state
+        out = self.dump_dom()
+        self.assertIn('data-act="force-release"', out)
+        self.assertNotIn('data-act="release"', out)
+
+    def dump_dom(self) -> str:
+        code = self.request("POST", "/api/launch-code", {})[1]["code"]  # as the launcher does
+        profile = tempfile.mkdtemp()
+        # Chrome hangs on startup when HOME is the empty test home; only the server needs that one.
+        env = dict(os.environ, HOME=pwd.getpwuid(os.getuid()).pw_dir)
+        try:
+            out = subprocess.run(
+                [CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                 f"--user-data-dir={profile}", "--virtual-time-budget=6000", "--dump-dom",
+                 f"http://127.0.0.1:{self.port}/#c={code}"],
+                capture_output=True, text=True, timeout=90, env=env).stdout
+        finally:
+            shutil.rmtree(profile, ignore_errors=True)
+        self.assertIn('class="item-name"', out, "page didn't render the downloads list")
+        self.assertNotIn(code, self.srv.LAUNCH_CODES)  # the page used it up
+        return out
+
     def test_torrent_names_render_as_text(self):
         self.srv.ROUTES[("GET", "/api/state")] = lambda _body: hostile_state()
         code = self.request("POST", "/api/launch-code", {})[1]["code"]  # as the launcher does

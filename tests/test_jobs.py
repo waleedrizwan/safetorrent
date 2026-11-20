@@ -153,7 +153,7 @@ class Listing(Base):
 
 class ReleaseState(Base):
     def release_info(self, **meta):
-        self.make(status="scanned", scan={"verdict": "CLEAN", "findings": []}, **meta)
+        self.make(**{"status": "scanned", "scan": {"verdict": "CLEAN", "findings": []}, **meta})
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             st.cmd_release_info(argparse.Namespace(id=ID), {})
@@ -162,6 +162,17 @@ class ReleaseState(Base):
     def test_release_info_says_whether_to_copy_automatically(self):
         self.assertEqual(self.release_info(auto_release=True), [ID, "scanned", "CLEAN", "auto", "Show"])
         self.assertEqual(self.release_info(auto_release=False)[3], "manual")
+
+    def test_unscanned_warning_is_reported_as_unscanned(self):
+        """Nothing scanned the bytes, so it mustn't copy as easily as an ordinary WARNING."""
+        unscanned = {"level": st.WARN, "path": "Tool/setup.exe", "msg": "too large", "unscanned": True}
+        scan_ = {"verdict": "WARNING", "findings": [unscanned]}
+        self.assertEqual(self.release_info(scan=scan_)[2], "UNSCANNED")
+        trusted = dict(unscanned, level=st.INFO)  # trust_checksum: the publisher's own file
+        self.assertEqual(self.release_info(scan={"verdict": "WARNING", "findings": [trusted]})[2], "WARNING")
+        ordinary = {"level": st.WARN, "path": "a.docm", "msg": "macros"}
+        self.assertEqual(self.release_info(scan={"verdict": "WARNING", "findings": [ordinary]})[2], "WARNING")
+        self.assertEqual(st.item_view(self.tmp / ID, set())["release_verdict"], "WARNING")
 
     def test_get_records_no_release(self):
         """`safetorrent get --no-release` must stop the app's auto-release too."""

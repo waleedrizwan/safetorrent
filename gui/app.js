@@ -183,7 +183,9 @@ function actions(m) {
   if (["queued", "downloading", "scanning"].includes(st)) out.push(b("stop", st === "scanning" ? "Stop scan" : "Pause"));
   if (["incomplete", "vpn-failed", "blocked"].includes(st)) out.push(b("start", "Resume", ""));
   if (st === "downloaded") out.push(b("scan", "Scan now", ""));
-  if (st === "scanned" && v === "WARNING") out.push(b("release", "Copy to my Mac", ""));
+  // Parts nothing could scan: never a plain one-click copy.
+  if (st === "scanned" && m.release_verdict === "UNSCANNED") out.push(b("force-release", "Copy anyway", "danger"));
+  else if (st === "scanned" && v === "WARNING") out.push(b("release", "Copy to my Mac", ""));
   if (st === "scanned" && v === "CLEAN" && !m.auto_release) out.push(b("release", "Copy to my Mac", ""));
   if (st === "scanned" && (v === "SUSPICIOUS" || v === "INFECTED")) out.push(b("force-release", "Copy anyway", "danger"));
   if (st === "released") out.push(b("reveal", "Show in Finder", ""), b("release-again", "Copy again"));
@@ -346,7 +348,9 @@ $("items").addEventListener("click", async (e) => {
   if (!act) return;
   const m = S.items.find((x) => x.id === id);
   if (act === "delete" && !confirm(`Delete "${m.name}" from quarantine?`)) return;
-  if (act === "force-release" && !confirm(`The scan flagged "${m.name}" as ${m.scan.verdict.toLowerCase()}. Copy it to your Mac anyway?`)) return;
+  const why = m && m.release_verdict === "UNSCANNED" ? "Parts of " + `"${m.name}" couldn't be virus-scanned.`
+    : m && `The scan flagged "${m.name}" as ${m.scan.verdict.toLowerCase()}.`;
+  if (act === "force-release" && !confirm(`${why} Copy it to your Mac anyway?`)) return;
   const map = {
     start: ["start", {}], "force-start": ["start", { force: true }], stop: ["stop", {}], scan: ["scan", {}],
     release: ["release", {}], "force-release": ["release", { force: true }], "release-again": ["release", { again: true }],

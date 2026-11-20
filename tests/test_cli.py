@@ -84,6 +84,14 @@ class Release(unittest.TestCase):
                 self.assertIn("stays in quarantine", res.stderr)
                 self.assert_nothing_copied(res)
 
+    def test_unscanned_needs_force(self):
+        res = self.release("scanned", "UNSCANNED")
+        self.assertIn("couldn't be virus-scanned", res.stderr)
+        self.assertIn("stays in quarantine", res.stderr)
+        self.assert_nothing_copied(res)
+        self.assertEqual(self.release("scanned", "UNSCANNED", "Show", "--force").returncode, 0)
+        self.assertTrue((self.downloads / "Show" / "ep1.mkv").exists())
+
     def test_force_overrides_verdict(self):
         self.assertEqual(self.release("scanned", "INFECTED", "Show", "--force").returncode, 0)
         self.assertTrue((self.downloads / "Show").is_dir())

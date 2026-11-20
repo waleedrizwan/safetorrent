@@ -221,6 +221,7 @@ class ExtractArchives(unittest.TestCase):
         out, _ = self.extract({"a.rar": {"files": {"part.mkv": b"x"}, "rc": 2, "out": "Data error"}},
                               [("a.rar", 100)])
         self.assertEqual(self.at(out, "a.rar")[0]["level"], st.WARN)
+        self.assertIs(self.at(out, "a.rar")[0]["unscanned"], True)  # only partly scanned: needs --force
         out, _ = self.extract({"b.rar": {"rc": 2, "out": "ERROR: Wrong password : x.exe"}}, [("b.rar", 100)])
         self.assertEqual(self.at(out, "b.rar")[0]["level"], st.DANGER)
 

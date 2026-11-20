@@ -190,6 +190,7 @@ release() {
   esac
   case "$verdict" in
     CLEAN|WARNING) ;;
+    UNSCANNED) [[ -n "$force" ]] || die "parts of $rid couldn't be virus-scanned; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
     *) [[ -n "$force" ]] || die "$rid was $verdict; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
   esac
 
@@ -269,6 +270,8 @@ cmd_get() {
     release "$id"
   elif [[ "$verdict" == CLEAN || "$verdict" == WARNING ]]; then
     echo "Kept in quarantine. When you're happy with the warnings above: safetorrent release $id"
+  elif [[ "$verdict" == UNSCANNED ]]; then
+    warn "Kept in quarantine: parts of it couldn't be virus-scanned. To copy it anyway: safetorrent release $id --force"
   else
     warn "Kept in quarantine; NOT copied to your Mac. Delete it with: safetorrent purge $id"
   fi

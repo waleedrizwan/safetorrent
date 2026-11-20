@@ -1003,7 +1003,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
             if re.search(r"Wrong password|encrypted", res.stdout + res.stderr, re.I):
                 out.append(finding(DANGER, rel, "password-protected archive: can't be scanned", encrypted=True))
             else:
-                out.append(finding(WARN, rel, "archive couldn't be fully extracted (damaged or unsupported); only partly scanned"))
+                out.append(finding(WARN, rel, "archive couldn't be fully extracted (damaged or unsupported); only partly scanned",
+                                   unscanned=True))
         inner = walk_files(dest)
         inner_rel = [(str(Path(rel + ".d") / p), s) for p, s in inner]
         out += check_names(inner_rel, inner_category, inner=True)
@@ -1406,6 +1407,7 @@ def item_view(d: Path, running: set[str]) -> dict:
                     error=meta.get("error") or "Interrupted (the VM may have restarted). Resume it to continue.")
         save_meta(d, meta)
     meta["running"] = alive
+    meta["release_verdict"] = release_verdict(meta)
     if meta["status"] == "downloading":
         meta["progress"] = download_progress(d)
     return meta
@@ -1643,9 +1645,21 @@ def safe_folder_name(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def release_verdict(meta: dict) -> str:
+    """The verdict the CLI and the app decide copying on. A WARNING where part of the
+    download was never scanned (too big for ClamAV, or an archive that wouldn't unpack)
+    is UNSCANNED, which needs --force like SUSPICIOUS. trust_checksum() has already
+    lowered anything the publisher's checksum vouches for to INFO."""
+    scan_ = meta.get("scan") or {}
+    v = scan_.get("verdict", "-")
+    if v == "WARNING" and any(f.get("unscanned") and f["level"] >= WARN for f in scan_.get("findings", [])):
+        return "UNSCANNED"
+    return v
+
+
 def cmd_release_info(args, cfg) -> int:
     meta = load_meta(item_dir(args.id))
-    verdict = (meta.get("scan") or {}).get("verdict", "-")
+    verdict = release_verdict(meta)
     auto = "auto" if meta.get("auto_release", True) else "manual"
     print("\t".join([meta["id"], meta["status"], verdict, auto, safe_folder_name(meta["name"], meta["id"])]))
     return 0
