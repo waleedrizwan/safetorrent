@@ -436,6 +436,17 @@ class HostileNamesInBrowser(ServerBase):
         self.assertIn('data-act="force-release"', out)
         self.assertNotIn('data-act="release"', out)
 
+    def test_item_the_macs_own_check_held_offers_only_copy_anyway(self):
+        state = hostile_state()
+        item = dict(state["items"][0], name="Show", status="scanned", release_verdict="CLEAN",
+                    scan={"verdict": "CLEAN", "findings": []}, auto_release=True)
+        state["items"] = [item]
+        state["errors"] = {item["id"]: "your Mac's own check held it back: Show/x.exe: a program; not copying anything."}
+        self.srv.ROUTES[("GET", "/api/state")] = lambda _body: state
+        out = self.dump_dom()
+        self.assertIn('data-act="force-release"', out)
+        self.assertNotIn('data-act="release"', out)
+
     def test_unvouched_item_offers_only_copy_anyway(self):
         state = hostile_state()
         state["items"] = [dict(state["items"][0], name="Tool", release_verdict="UNVOUCHED")]

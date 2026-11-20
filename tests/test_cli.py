@@ -320,7 +320,8 @@ class Release(unittest.TestCase):
     def test_every_file_gets_gatekeeper_quarantine_flag(self):
         (self.vm_files / "Show" / "App.app" / "Contents").mkdir(parents=True)
         (self.vm_files / "Show" / "App.app" / "Contents" / "run").write_bytes(b"#!/bin/sh\n")
-        self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
+        # An unsigned app in a show: the Mac's own check holds it, so force it through.
+        self.assertEqual(self.release("scanned", "CLEAN", "Show", "--force").returncode, 0)
         dest = self.downloads / "Show"
         paths = [dest, *dest.rglob("*")]
         self.assertGreater(len(paths), 4)
@@ -328,6 +329,19 @@ class Release(unittest.TestCase):
             flag = subprocess.run(["xattr", "-p", "com.apple.quarantine", str(p)], capture_output=True, text=True)
             self.assertEqual(flag.returncode, 0, f"no quarantine flag on {p}")
             self.assertIn(";safetorrent;", flag.stdout)
+
+    def test_mac_rechecks_what_the_vm_called_clean(self):
+        """A taken-over VM can report CLEAN for anything; the Mac's own rules still catch it."""
+        (self.vm_files / "Show" / "Codec_Installer.exe").write_bytes(b"MZ")  # smaller than the episode
+        res = self.release("scanned", "CLEAN")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Codec_Installer.exe", res.stderr)
+        self.assertIn("your Mac's own check held it back: Show/Codec_Installer.exe:", res.stderr)
+        self.assertFalse(any("mark-released" in c for c in self.calls()))
+        self.assertEqual(list(self.downloads.iterdir()), [])
+        res = self.release("scanned", "CLEAN", "Show", "--force")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((self.downloads / "Show" / "Codec_Installer.exe").exists())
 
     def test_no_release_when_the_quarantine_flag_cant_be_set(self):
         """Some drives drop extended attributes: an app copied there would open with no Gatekeeper check."""
