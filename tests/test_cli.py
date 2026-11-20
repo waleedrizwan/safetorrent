@@ -1,12 +1,14 @@
 """Tests for `safetorrent release`, the step that copies files onto the Mac.
 Runs the real bash script against a fake `limactl` that plays the VM."""
 import hashlib
+import io
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,17 +16,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RID = "abcdef0123"
 
-# Answers `vm_status`, the guest's release-info / mark-released, and the rsync copy out of the VM.
+# Answers `vm_status` and the guest's release-info / manifest / send / mark-released.
 FAKE_LIMACTL = r"""#!/bin/bash
 echo "$*" >> "$FAKE_LOG"
 case "$1" in
   list) echo Running ;;
-  copy)
-    src=${@: -2:1}; dst=${@: -1}
-    sleep "${FAKE_SLEEP:-0}"; cp -Rp "$FAKE_VM_FILES/." "$dst" ;;  # keeps links and modes, like rsync -a
   shell)
     while [[ "$1" != st-guest ]]; do shift; done; shift
     case "$1" in
+      send)
+        # The download as a tar stream. bsdtar keeps symlinks, FIFOs and modes as they are,
+        # like a compromised VM could send them.
+        [[ -t 0 ]] && { echo "send got a terminal on stdin: binary output would be mangled" >&2; exit 9; }
+        sleep "${FAKE_SLEEP:-0}"
+        if [[ -n "${FAKE_TAR:-}" ]]; then cat "$FAKE_TAR"; else COPYFILE_DISABLE=1 tar -C "$FAKE_VM_FILES" -cf - .; fi ;;
       release-info)
         # A second answer, if set, plays a rescan that finished while copying.
         if [[ -n "${FAKE_RELEASE_INFO2:-}" && -e "$FAKE_LOG.asked" ]]; then printf '%s\n' "$FAKE_RELEASE_INFO2"
@@ -77,7 +82,7 @@ class Release(unittest.TestCase):
 
     def assert_nothing_copied(self, res):
         self.assertNotEqual(res.returncode, 0)
-        self.assertFalse(any(c.startswith("copy") for c in self.calls()))
+        self.assertFalse(any("st-guest send" in c for c in self.calls()))
         self.assertFalse(any("mark-released" in c for c in self.calls()))
         self.assertEqual(list(self.downloads.iterdir()) if self.downloads.exists() else [], [])
 
@@ -271,12 +276,29 @@ class Release(unittest.TestCase):
     def test_extra_or_missing_file_is_refused(self):
         video = (self.vm_files / "Show" / "ep1.mkv").read_bytes()
         self.env["FAKE_MANIFEST"] = str(self.manifest_of({"Show/ep1.mkv": video}))
-        (self.vm_files / "Show" / "extra.exe").write_bytes(b"MZ")
+        # Empty, so the stream isn't bigger than what was scanned and the manifest check is what refuses it.
+        (self.vm_files / "Show" / "extra.exe").write_bytes(b"")
         self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "never scanned: Show/extra.exe")
+        self.log.unlink()
+        (self.vm_files / "Show" / "extra.exe").write_bytes(b"MZ")
+        self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "more than was scanned")
         (self.vm_files / "Show" / "extra.exe").unlink()
         self.log.unlink()
         self.env["FAKE_MANIFEST"] = str(self.manifest_of({"Show/ep1.mkv": video, "Show/ep2.mkv": video}))
         self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "missing: Show/ep2.mkv")
+
+    def test_hostile_stream_from_the_vm_writes_nothing_outside(self):
+        """A compromised VM sends whatever it likes: a path out of the staging folder."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            ti = tarfile.TarInfo("../../Library/LaunchAgents/evil.plist")
+            ti.size = 2
+            tar.addfile(ti, io.BytesIO(b"<x"))
+        (self.tmp / "evil.tar").write_bytes(buf.getvalue())
+        self.env["FAKE_TAR"] = str(self.tmp / "evil.tar")
+        self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "path leading out of the folder")
+        self.assertFalse((self.home / "Library").exists())
+        self.assertFalse((self.home / "Downloads" / "Library").exists())
 
     def test_missing_manifest_is_refused(self):
         self.env["FAKE_MANIFEST"] = "/nonexistent"
@@ -285,7 +307,7 @@ class Release(unittest.TestCase):
     def test_verdict_changed_during_copy_is_refused(self):
         self.env["FAKE_RELEASE_INFO2"] = "\t".join([RID, "scanned", "INFECTED", "auto", "Show", "later"])
         res = self.release("scanned", "CLEAN")
-        self.assertTrue(any(c.startswith("copy") for c in self.calls()))  # copied, then thrown away
+        self.assertTrue(any("st-guest send" in c for c in self.calls()))  # copied, then thrown away
         self.assert_mismatch_refused(res, "scan result changed while copying")
 
     @unittest.skipUnless(sys.platform == "darwin", "Gatekeeper's quarantine flag is macOS-only")

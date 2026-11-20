@@ -204,9 +204,16 @@ release() {
   rm -rf "$tmp"; mkdir "$tmp"
   # What the scan saw: every file's size and SHA-256, recorded when it finished.
   guest manifest "$rid" > "$manifest" || die "couldn't get the record of what was scanned; not copying anything"
-  limactl copy --backend=rsync -r "$VM:/srv/quarantine/$rid/files/" "$tmp/" >/dev/null
-  # rsync -a (what Lima runs) keeps symlinks, special files and modes. A symlink
-  # could point at ~/.ssh or ~/Library, and nothing in the VM scanned it.
+  # Not rsync: with `limactl copy` the VM is the rsync server, and rsync clients have
+  # had bugs that let a malicious server write outside the destination before any
+  # check here runs. Instead the VM streams a tar, and receive.py unpacks it, taking
+  # only plain files and folders, under a sandbox that can't write anywhere but $tmp.
+  [[ -x /usr/bin/sandbox-exec ]] || die "macOS's sandbox-exec is missing, so nothing can be copied out of the VM safely"
+  local stage; stage=$(cd "$tmp" && pwd -P)   # the sandbox matches real paths (/private/var…)
+  guest send "$rid" </dev/null | /usr/bin/sandbox-exec -f "$ROOT/host/receive.sb" -D STAGE="$stage" \
+    /usr/bin/python3 -I "$ROOT/host/receive.py" "$stage" "$manifest" || die "not copying anything"
+  # receive.py never creates anything else, but this is the last gate before your Mac:
+  # a symlink could point at ~/.ssh or ~/Library.
   [[ -z "$(find "$tmp" ! -type f ! -type d -print -quit)" ]] || die "the copy contained symlinks or special files; not copying anything"
   chmod -R u+rwX,go-w,ug-s "$tmp"   # no setuid/setgid, nothing others can change
   # Exactly the bytes that were scanned: nothing changed, added or left out since.
@@ -340,7 +347,11 @@ main() {
         info=$(guest release-info "$1"); IFS=$'\t' read -r _ status verdict auto _ <<< "$info"
         if [[ "$status" == scanned && "$verdict" == CLEAN && "$auto" == auto ]]; then echo; release "$1"; fi
       fi ;;
-    vpn|update|doctor|health) ensure_vm; push; guest "$cmd" ;;
+    doctor)
+      if [[ -x /usr/bin/sandbox-exec ]]; then echo "  ✓ Mac: copies out of the VM are unpacked in a sandbox"
+      else warn "  ✖ Mac: sandbox-exec is missing, so nothing can be copied out of the VM"; fi
+      ensure_vm; push; guest doctor ;;
+    vpn|update|health) ensure_vm; push; guest "$cmd" ;;
     vpn-import) cmd_vpn_import "$@" ;;
     stop-download|pause) ensure_vm; guest stop "${1:?usage: safetorrent $cmd <id>}" ;;
     sync) ensure_vm; push; guest last >/dev/null ;;   # used by the app: hand the VM the current config

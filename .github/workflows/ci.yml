@@ -39,6 +39,6 @@ jobs:
         # B905 (zip strict=) needs Python 3.10, and the app server runs on macOS's 3.9.
         run: ruff check --select E,F,W,B --ignore E501,B905 vm gui host tests e2e
       - name: mypy
-        run: mypy --ignore-missing-imports --python-version 3.9 vm/st-guest.py gui/server.py host/verify_manifest.py
+        run: mypy --ignore-missing-imports --python-version 3.9 vm/st-guest.py gui/server.py host/verify_manifest.py host/receive.py
       - name: shellcheck
         run: shellcheck safetorrent gui/launch.sh gui/make-app.sh

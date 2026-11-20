@@ -1,0 +1,12 @@
+;; sandbox-exec profile for receive.py: it may write only inside the staging
+;; folder (passed as -D STAGE=<real path>) and may not use the network.
+;; sandbox-exec is deprecated but still ships with macOS; `safetorrent doctor`
+;; reports it if it's ever missing, and release refuses to copy without it.
+(version 1)
+(allow default)
+(deny network*)
+(deny file-write*)
+(allow file-write* (subpath (param "STAGE")))
+(allow file-write-data (literal "/dev/null"))
+;; /usr/bin/python3 is a shim: xcrun caches its lookup in a file named xcrun_db*.
+(allow file-write* (regex #"/xcrun_db[^/]*$"))

@@ -30,6 +30,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -1743,6 +1744,40 @@ def cmd_manifest(args, cfg) -> int:
     return 0
 
 
+def cmd_send(args, cfg) -> int:
+    """The download's files as a tar stream on stdout, for the Mac's receiver. Only
+    regular files and folders: anything else was flagged in the scan and never leaves."""
+    d = item_dir(args.id)
+    if load_meta(d)["status"] not in ("scanned", "released"):
+        die("it hasn't finished downloading and scanning")
+    root = d / "files"
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+        for dirpath, dirs, names in os.walk(root):  # doesn't follow links to folders
+            dirs.sort()
+            for n in dirs + sorted(names):
+                p = Path(dirpath) / n
+                rel = str(p.relative_to(root))
+                if p.is_symlink():
+                    continue
+                if p.is_dir():
+                    ti = tarfile.TarInfo(rel)
+                    ti.type, ti.mode = tarfile.DIRTYPE, 0o755
+                    tar.addfile(ti)
+                    continue
+                try:
+                    fh = open_nofollow(p)
+                except OSError:
+                    continue  # FIFO, socket or device
+                with fh:
+                    st_ = os.fstat(fh.fileno())
+                    ti = tarfile.TarInfo(rel)
+                    ti.size, ti.mtime = st_.st_size, int(st_.st_mtime)
+                    ti.mode = 0o755 if st_.st_mode & 0o100 else 0o644
+                    tar.addfile(ti, fh)
+    sys.stdout.buffer.flush()
+    return 0
+
+
 def cmd_mark_released(args, cfg) -> int:
     d = item_dir(args.id)
     meta = load_meta(d)
@@ -1878,7 +1913,7 @@ def main() -> int:
     rn = sub.add_parser("run")
     rn.add_argument("id")
     rn.add_argument("--scan-only", action="store_true")
-    for name in ("resume", "rescan", "report", "release-info", "manifest", "purge", "stop", "item"):
+    for name in ("resume", "rescan", "report", "release-info", "manifest", "send", "purge", "stop", "item"):
         sub.add_parser(name).add_argument("id")
     mr = sub.add_parser("mark-released")
     mr.add_argument("id")
@@ -1890,7 +1925,7 @@ def main() -> int:
         "get": cmd_get, "add": cmd_add, "start": cmd_start, "run": cmd_run, "stop": cmd_stop,
         "items": cmd_items, "item": cmd_item, "health": cmd_health, "doctor": cmd_health,
         "resume": cmd_resume, "rescan": cmd_rescan, "report": cmd_report,
-        "release-info": cmd_release_info, "manifest": cmd_manifest, "mark-released": cmd_mark_released, "purge": cmd_purge,
+        "release-info": cmd_release_info, "manifest": cmd_manifest, "send": cmd_send, "mark-released": cmd_mark_released, "purge": cmd_purge,
         "list": cmd_list, "last": cmd_last, "vpn": cmd_vpn, "update": cmd_update,
     }
     try:
