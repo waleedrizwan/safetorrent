@@ -4,6 +4,7 @@ the process working on each item; the GUI's status refresh and `start` must
 respect it. Runs anywhere: /proc and systemd are faked."""
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -160,7 +161,7 @@ class ReleaseState(Base):
         return out.getvalue().rstrip("\n").split("\t")
 
     def test_release_info_says_whether_to_copy_automatically(self):
-        self.assertEqual(self.release_info(auto_release=True), [ID, "scanned", "CLEAN", "auto", "Show"])
+        self.assertEqual(self.release_info(auto_release=True), [ID, "scanned", "CLEAN", "auto", "Show", "-"])
         self.assertEqual(self.release_info(auto_release=False)[3], "manual")
 
     def test_unscanned_warning_is_reported_as_unscanned(self):
@@ -295,6 +296,61 @@ class SpecialFiles(Base):
         os.mkfifo(root / "pipe")
         (root / "ok.txt").write_text("x")
         self.assertEqual(st.special_entries(root), ["pipe"])
+
+
+class Manifest(Base):
+    """What the scan saw, so the Mac can check it received exactly that."""
+
+    def scanned(self):
+        d = self.make(status="downloaded", category="media")
+        (d / "files" / "Show").mkdir(parents=True)
+        (d / "files" / "Show" / "ep1.mkv").write_bytes(b"\x1a\x45\xdf\xa3video")
+        (d / "files" / "Show" / "notes.txt").write_bytes(b"hello")
+        with mock.patch.multiple(st, run=mock.DEFAULT, ensure_firewall=mock.DEFAULT,
+                                 extract_archives=mock.Mock(return_value=[]),
+                                 clamav_scan=mock.Mock(return_value=[]), virustotal=mock.Mock(return_value=[])):
+            st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
+        return d
+
+    def manifest(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            st.cmd_manifest(argparse.Namespace(id=ID), {})
+        return json.loads(out.getvalue())
+
+    def test_scan_writes_a_manifest(self):
+        d = self.scanned()
+        files = d / "files"
+        want = {rel: [len((files / rel).read_bytes()), hashlib.sha256((files / rel).read_bytes()).hexdigest()]
+                for rel in ("Show/ep1.mkv", "Show/notes.txt")}
+        self.assertEqual(json.loads((d / "manifest.json").read_text()), want)
+        self.assertEqual((d / "manifest.json").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(st.load_meta(d)["scan"]["manifest"],
+                         hashlib.sha256((d / "manifest.json").read_bytes()).hexdigest())
+        self.assertEqual(self.manifest(), want)
+
+    def test_tampered_or_missing_manifest_is_refused(self):
+        d = self.scanned()
+        (d / "manifest.json").write_text('{"Show/ep1.mkv": [1, "' + "0" * 64 + '"]}')
+        with self.assertRaisesRegex(st.StError, "changed since the scan"):
+            self.manifest()
+        (d / "manifest.json").unlink()
+        with self.assertRaisesRegex(st.StError, "missing"):
+            self.manifest()
+
+    def test_scanned_by_an_older_version_needs_a_rescan(self):
+        self.make(status="scanned", scan={"verdict": "CLEAN", "findings": []})
+        with self.assertRaisesRegex(st.StError, "rescan"):
+            self.manifest()
+
+    def test_release_info_ends_with_the_scan_time(self):
+        """So a rescan between the two release-info calls aborts the copy."""
+        d = self.make(status="scanned", scan={"verdict": "CLEAN", "findings": [], "at": "2026-11-19T10:00:00+00:00"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            st.cmd_release_info(argparse.Namespace(id=ID), {})
+        self.assertEqual(out.getvalue().rstrip("\n").split("\t")[-1], "2026-11-19T10:00:00+00:00")
+        self.assertTrue(d.exists())
 
 
 class Update(unittest.TestCase):

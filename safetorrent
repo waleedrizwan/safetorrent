@@ -163,7 +163,7 @@ safe_name() {
 }
 
 release() {
-  local id=$1 force="" again="" info rid status verdict auto name
+  local id=$1 force="" again="" info rid status verdict auto name _at
   shift
   for opt in "$@"; do
     case "$opt" in
@@ -173,7 +173,7 @@ release() {
     esac
   done
   info=$(guest release-info "$id") || exit 1
-  IFS=$'\t' read -r rid status verdict auto name <<< "$info"
+  IFS=$'\t' read -r rid status verdict auto name _at <<< "$info"
   # The VM is untrusted: a compromised one could send ../ in name or rid and write
   # anywhere in your home folder. Check every field before it goes into a Mac path.
   [[ "$rid" =~ ^[0-9a-f]{6,40}$ && "$rid" == "$id"* ]] || die "the VM returned an invalid id; not copying anything"
@@ -197,15 +197,23 @@ release() {
   [[ "$DOWNLOAD_DIR" == /* ]] || die "DOWNLOAD_DIR must be a full path (like ~/Downloads/SafeTorrents), not: $DOWNLOAD_DIR"
   mkdir -p "$DOWNLOAD_DIR"
   local lock="$DOWNLOAD_DIR/.release-$rid.lock" tmp="$DOWNLOAD_DIR/.incoming-$rid"
+  local manifest="$DOWNLOAD_DIR/.incoming-$rid.manifest"
   take_lock "$lock" || die "$rid is already being copied to your Mac."
   # shellcheck disable=SC2064  # expand now: the trap runs after these locals are gone
-  trap "rm -rf $(printf %q "$tmp") $(printf %q "$lock")" EXIT
+  trap "rm -rf $(printf %q "$tmp") $(printf %q "$manifest") $(printf %q "$lock")" EXIT
   rm -rf "$tmp"; mkdir "$tmp"
+  # What the scan saw: every file's size and SHA-256, recorded when it finished.
+  guest manifest "$rid" > "$manifest" || die "couldn't get the record of what was scanned; not copying anything"
   limactl copy --backend=rsync -r "$VM:/srv/quarantine/$rid/files/" "$tmp/" >/dev/null
   # rsync -a (what Lima runs) keeps symlinks, special files and modes. A symlink
   # could point at ~/.ssh or ~/Library, and nothing in the VM scanned it.
   [[ -z "$(find "$tmp" ! -type f ! -type d -print -quit)" ]] || die "the copy contained symlinks or special files; not copying anything"
   chmod -R u+rwX,go-w,ug-s "$tmp"   # no setuid/setgid, nothing others can change
+  # Exactly the bytes that were scanned: nothing changed, added or left out since.
+  echo "Verifying…"
+  /usr/bin/python3 -I "$ROOT/host/verify_manifest.py" "$tmp" "$manifest" || die "not copying anything"
+  # And the verdict still stands: a rescan may have finished while this was copying.
+  [[ "$(guest release-info "$id")" == "$info" ]] || die "the scan result changed while copying; not copying anything. Check it with: safetorrent report $rid"
 
   # files/ holds the torrent's one top-level folder (or its one file): release that
   # itself rather than a folder of the same name around it.
@@ -227,7 +235,7 @@ release() {
   # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.
   find "$dest" -exec xattr -s -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
   guest mark-released "$rid" "$dest"
-  rm -rf "$tmp" "$lock"; trap - EXIT
+  rm -rf "$tmp" "$manifest" "$lock"; trap - EXIT
   printf '\033[32mReleased:\033[0m %s\n' "$dest"
 }
 

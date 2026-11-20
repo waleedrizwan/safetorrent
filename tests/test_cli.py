@@ -1,5 +1,7 @@
 """Tests for `safetorrent release`, the step that copies files onto the Mac.
 Runs the real bash script against a fake `limactl` that plays the VM."""
+import hashlib
+import json
 import os
 import shutil
 import stat
@@ -23,7 +25,20 @@ case "$1" in
   shell)
     while [[ "$1" != st-guest ]]; do shift; done; shift
     case "$1" in
-      release-info) printf '%s\n' "$FAKE_RELEASE_INFO" ;;
+      release-info)
+        # A second answer, if set, plays a rescan that finished while copying.
+        if [[ -n "${FAKE_RELEASE_INFO2:-}" && -e "$FAKE_LOG.asked" ]]; then printf '%s\n' "$FAKE_RELEASE_INFO2"
+        else printf '%s\n' "$FAKE_RELEASE_INFO"; fi
+        touch "$FAKE_LOG.asked" ;;
+      manifest)
+        # What the scan saw: FAKE_MANIFEST if given, otherwise the VM's files as they are.
+        if [[ -n "${FAKE_MANIFEST:-}" ]]; then cat "$FAKE_MANIFEST"; else /usr/bin/python3 -I -c '
+import hashlib, json, os, sys
+root = sys.argv[1]
+print(json.dumps({os.path.relpath(os.path.join(d, n), root): [os.path.getsize(os.path.join(d, n)),
+      hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()]
+      for d, _, ns in os.walk(root) for n in ns if os.path.isfile(os.path.join(d, n))
+      and not os.path.islink(os.path.join(d, n))}))' "$FAKE_VM_FILES"; fi ;;
       mark-released) ;;
       *) echo "unexpected guest call: $*" >&2; exit 9 ;;
     esac ;;
@@ -237,6 +252,41 @@ class Release(unittest.TestCase):
         self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
         mode = os.stat(self.downloads / "Show" / "ep1.mkv").st_mode
         self.assertEqual(mode & (stat.S_ISUID | stat.S_ISGID | stat.S_IWGRP | stat.S_IWOTH), 0)
+
+    def manifest_of(self, files: dict) -> Path:
+        path = self.tmp / "manifest.json"
+        path.write_text(json.dumps({rel: [len(data), hashlib.sha256(data).hexdigest()] for rel, data in files.items()}))
+        return path
+
+    def assert_mismatch_refused(self, res, why):
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn(why, res.stderr)
+        self.assertFalse(any("mark-released" in c for c in self.calls()))
+        self.assertEqual(list(self.downloads.iterdir()), [])  # nothing moved in, staging and manifest gone
+
+    def test_file_changed_after_the_scan_is_refused(self):
+        self.env["FAKE_MANIFEST"] = str(self.manifest_of({"Show/ep1.mkv": b"\x1a\x45\xdf\xa3original"}))
+        self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "changed after the scan")
+
+    def test_extra_or_missing_file_is_refused(self):
+        video = (self.vm_files / "Show" / "ep1.mkv").read_bytes()
+        self.env["FAKE_MANIFEST"] = str(self.manifest_of({"Show/ep1.mkv": video}))
+        (self.vm_files / "Show" / "extra.exe").write_bytes(b"MZ")
+        self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "never scanned: Show/extra.exe")
+        (self.vm_files / "Show" / "extra.exe").unlink()
+        self.log.unlink()
+        self.env["FAKE_MANIFEST"] = str(self.manifest_of({"Show/ep1.mkv": video, "Show/ep2.mkv": video}))
+        self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "missing: Show/ep2.mkv")
+
+    def test_missing_manifest_is_refused(self):
+        self.env["FAKE_MANIFEST"] = "/nonexistent"
+        self.assert_mismatch_refused(self.release("scanned", "CLEAN"), "record of what was scanned")
+
+    def test_verdict_changed_during_copy_is_refused(self):
+        self.env["FAKE_RELEASE_INFO2"] = "\t".join([RID, "scanned", "INFECTED", "auto", "Show", "later"])
+        res = self.release("scanned", "CLEAN")
+        self.assertTrue(any(c.startswith("copy") for c in self.calls()))  # copied, then thrown away
+        self.assert_mismatch_refused(res, "scan result changed while copying")
 
     @unittest.skipUnless(sys.platform == "darwin", "Gatekeeper's quarantine flag is macOS-only")
     def test_every_file_gets_gatekeeper_quarantine_flag(self):

@@ -557,12 +557,19 @@ def read_head(path: Path, n: int = 1024) -> bytes:
         return fh.read(n)
 
 
+_HASHES: dict[tuple, str] = {}  # VirusTotal, the checksum and the manifest each hash the same files
+
+
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
     with open_nofollow(path) as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        st_ = os.fstat(fh.fileno())
+        key = (st_.st_dev, st_.st_ino, st_.st_size, st_.st_mtime_ns, st_.st_ctime_ns)
+        if key not in _HASHES:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+            _HASHES[key] = h.hexdigest()
+        return _HASHES[key]
 
 
 # ---------------------------------------------------------------- network isolation
@@ -1250,6 +1257,20 @@ def trust_checksum(findings: list[dict]) -> None:
 
 
 
+def write_manifest(d: Path) -> str:
+    """Size and SHA-256 of every file that was scanned, so the Mac can check that what
+    it received is exactly that. Root's, in root's folder. Returns its own SHA-256."""
+    files = walk_files(d / "files")
+    data = json.dumps({rel: [size, sha256_file(d / "files" / rel)] for rel, size in files},
+                      sort_keys=True).encode()
+    fd, tmp = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=d)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, d / "manifest.json")
+    return hashlib.sha256(data).hexdigest()
+
+
 def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     # 7z and ClamAV run as the torrent user on hostile files, so the torrent user's
     # network limits must be up first. Rules don't survive a VM reboot, and rescan
@@ -1292,11 +1313,13 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         set_phase(d, meta, "Checking the publisher's checksum")
         findings += verify_checksum(d, meta["sha256"])
         trust_checksum(findings)
+    set_phase(d, meta, "Recording what was scanned")
+    manifest = write_manifest(d)
     level = max_level(findings)
     # A rescan of something already copied keeps it "released": rescanning must not
     # make it look new and get it copied again.
     meta.update(status="released" if meta.get("released_to") else "scanned", phase="",
-                scan={"verdict": SCAN_VERDICT[level], "findings": findings, "at": now()})
+                scan={"verdict": SCAN_VERDICT[level], "findings": findings, "at": now(), "manifest": manifest})
     save_meta(d, meta)
     if not quiet:
         print_report(meta)
@@ -1671,7 +1694,27 @@ def cmd_release_info(args, cfg) -> int:
     meta = load_meta(item_dir(args.id))
     verdict = release_verdict(meta)
     auto = "auto" if meta.get("auto_release", True) else "manual"
-    print("\t".join([meta["id"], meta["status"], verdict, auto, safe_folder_name(meta["name"], meta["id"])]))
+    # The scan time last: the Mac asks again after copying, and a rescan in between must abort the copy.
+    scanned_at = re.sub(r"\s", "", str((meta.get("scan") or {}).get("at", "-")))
+    print("\t".join([meta["id"], meta["status"], verdict, auto, safe_folder_name(meta["name"], meta["id"]),
+                     scanned_at]))
+    return 0
+
+
+def cmd_manifest(args, cfg) -> int:
+    d = item_dir(args.id)
+    want = (load_meta(d).get("scan") or {}).get("manifest")
+    if not want:
+        die("there's no record of what was scanned (it was scanned by an older version). "
+            f"Scan it again first: safetorrent rescan {args.id}")
+    try:
+        with open_nofollow(d / "manifest.json") as fh:
+            data = fh.read()
+    except OSError:
+        die("the record of what was scanned is missing; scan it again first")
+    if hashlib.sha256(data).hexdigest() != want:
+        die("the record of what was scanned has been changed since the scan; not trusting it")
+    sys.stdout.write(data.decode() + "\n")
     return 0
 
 
@@ -1810,7 +1853,7 @@ def main() -> int:
     rn = sub.add_parser("run")
     rn.add_argument("id")
     rn.add_argument("--scan-only", action="store_true")
-    for name in ("resume", "rescan", "report", "release-info", "purge", "stop", "item"):
+    for name in ("resume", "rescan", "report", "release-info", "manifest", "purge", "stop", "item"):
         sub.add_parser(name).add_argument("id")
     mr = sub.add_parser("mark-released")
     mr.add_argument("id")
@@ -1822,7 +1865,7 @@ def main() -> int:
         "get": cmd_get, "add": cmd_add, "start": cmd_start, "run": cmd_run, "stop": cmd_stop,
         "items": cmd_items, "item": cmd_item, "health": cmd_health, "doctor": cmd_health,
         "resume": cmd_resume, "rescan": cmd_rescan, "report": cmd_report,
-        "release-info": cmd_release_info, "mark-released": cmd_mark_released, "purge": cmd_purge,
+        "release-info": cmd_release_info, "manifest": cmd_manifest, "mark-released": cmd_mark_released, "purge": cmd_purge,
         "list": cmd_list, "last": cmd_last, "vpn": cmd_vpn, "update": cmd_update,
     }
     try:
