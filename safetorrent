@@ -179,7 +179,7 @@ release() {
   [[ "$rid" =~ ^[0-9a-f]{6,40}$ && "$rid" == "$id"* ]] || die "the VM returned an invalid id; not copying anything"
   [[ "$auto" == auto || "$auto" == manual ]] || die "the VM returned bad data; not copying anything"
   case "$verdict" in
-    CLEAN|WARNING|SUSPICIOUS|INFECTED|UNSCANNED|-) ;;
+    CLEAN|WARNING|SUSPICIOUS|INFECTED|UNSCANNED|UNVOUCHED|-) ;;
     *) die "the VM returned bad data; not copying anything" ;;
   esac
   safe_name "$name" || die "the VM returned an unsafe name; not copying anything"
@@ -191,6 +191,7 @@ release() {
   case "$verdict" in
     CLEAN|WARNING) ;;
     UNSCANNED) [[ -n "$force" ]] || die "parts of $rid couldn't be virus-scanned; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
+    UNVOUCHED) [[ -n "$force" ]] || die "$rid has programs no antivirus has a verdict on (new malware looks just like this); it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
     *) [[ -n "$force" ]] || die "$rid was $verdict; it stays in quarantine. (Override: safetorrent release $rid --force)" ;;
   esac
 
@@ -287,6 +288,8 @@ cmd_get() {
     echo "Kept in quarantine. When you're happy with the warnings above: safetorrent release $id"
   elif [[ "$verdict" == UNSCANNED ]]; then
     warn "Kept in quarantine: parts of it couldn't be virus-scanned. To copy it anyway: safetorrent release $id --force"
+  elif [[ "$verdict" == UNVOUCHED ]]; then
+    warn "Kept in quarantine: it has programs no antivirus has a verdict on. To copy it anyway: safetorrent release $id --force"
   else
     warn "Kept in quarantine; NOT copied to your Mac. Delete it with: safetorrent purge $id"
   fi

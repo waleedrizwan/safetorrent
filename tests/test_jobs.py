@@ -175,6 +175,19 @@ class ReleaseState(Base):
         self.assertEqual(self.release_info(scan={"verdict": "WARNING", "findings": [ordinary]})[2], "WARNING")
         self.assertEqual(st.item_view(self.tmp / ID, set())["release_verdict"], "WARNING")
 
+    def test_unvouched_program_is_reported_as_unvouched(self):
+        """VirusTotal has never seen it and nothing else vouches for it: brand-new malware looks like this."""
+        unvouched = {"level": st.WARN, "path": "Tool/setup.exe", "msg": "never seen", "unvouched": True}
+        self.assertEqual(self.release_info(scan={"verdict": "WARNING", "findings": [unvouched]})[2], "UNVOUCHED")
+        vouched = dict(unvouched, level=st.INFO)  # trust_checksum: the publisher's own file
+        self.assertEqual(self.release_info(scan={"verdict": "WARNING", "findings": [vouched]})[2], "WARNING")
+        unscanned = {"level": st.WARN, "path": "big.iso", "msg": "too large", "unscanned": True}
+        self.assertEqual(self.release_info(scan={"verdict": "WARNING", "findings": [unvouched, unscanned]})[2],
+                         "UNSCANNED")
+        flagged = {"level": st.DANGER, "path": "x.exe", "msg": "flagged"}
+        self.assertEqual(self.release_info(scan={"verdict": "SUSPICIOUS", "findings": [unvouched, flagged]})[2],
+                         "SUSPICIOUS")
+
     def test_get_records_no_release(self):
         """`safetorrent get --no-release` must stop the app's auto-release too."""
         health = {"checks": [{"id": "vpn", "state": "ok", "title": "VPN", "detail": ""}]}

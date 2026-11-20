@@ -1739,12 +1739,16 @@ def safe_folder_name(name: str, fallback: str) -> str:
 def release_verdict(meta: dict) -> str:
     """The verdict the CLI and the app decide copying on. A WARNING where part of the
     download was never scanned (too big for ClamAV, or an archive that wouldn't unpack)
-    is UNSCANNED, which needs --force like SUSPICIOUS. trust_checksum() has already
-    lowered anything the publisher's checksum vouches for to INFO."""
+    is UNSCANNED; one with a program no antivirus has a verdict on (brand-new malware
+    looks exactly like this) is UNVOUCHED. Both need --force like SUSPICIOUS.
+    trust_checksum() has already lowered anything the publisher's checksum vouches for to INFO."""
     scan_ = meta.get("scan") or {}
     v = scan_.get("verdict", "-")
-    if v == "WARNING" and any(f.get("unscanned") and f["level"] >= WARN for f in scan_.get("findings", [])):
+    held = [f for f in scan_.get("findings", []) if f["level"] >= WARN]
+    if v == "WARNING" and any(f.get("unscanned") for f in held):
         return "UNSCANNED"
+    if v == "WARNING" and any(f.get("unvouched") for f in held):
+        return "UNVOUCHED"
     return v
 
 

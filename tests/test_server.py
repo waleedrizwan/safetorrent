@@ -413,6 +413,7 @@ class UntrustedItems(ServerBase):
     def test_release_verdict_is_checked_too(self):
         base = {"id": self.ID, "status": "scanned"}
         self.assertEqual(self.srv.sanitize_item(dict(base, release_verdict="UNSCANNED"))["release_verdict"], "UNSCANNED")
+        self.assertEqual(self.srv.sanitize_item(dict(base, release_verdict="UNVOUCHED"))["release_verdict"], "UNVOUCHED")
         self.assertEqual(self.srv.sanitize_item(dict(base, release_verdict="<b>"))["release_verdict"], "SUSPICIOUS")
         self.assertNotIn("release_verdict", self.srv.sanitize_item(base))
 
@@ -430,6 +431,14 @@ class HostileNamesInBrowser(ServerBase):
         state = hostile_state()
         item = dict(state["items"][0], name="Tool", release_verdict="UNSCANNED")
         state["items"] = [item]
+        self.srv.ROUTES[("GET", "/api/state")] = lambda _body: state
+        out = self.dump_dom()
+        self.assertIn('data-act="force-release"', out)
+        self.assertNotIn('data-act="release"', out)
+
+    def test_unvouched_item_offers_only_copy_anyway(self):
+        state = hostile_state()
+        state["items"] = [dict(state["items"][0], name="Tool", release_verdict="UNVOUCHED")]
         self.srv.ROUTES[("GET", "/api/state")] = lambda _body: state
         out = self.dump_dom()
         self.assertIn('data-act="force-release"', out)
