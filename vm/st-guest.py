@@ -2225,6 +2225,14 @@ def secure_layout() -> None:
 UNPRIVILEGED = {"yara-scan": cmd_yara_scan}
 
 
+def agent_readable() -> None:
+    """The torrent user runs this file for the YARA scan (it holds no secrets).
+    VMs set up before that made its folder root-only."""
+    folder = Path("/opt/safetorrent")
+    if AGENT.parent == folder and folder.stat().st_mode & 0o777 != 0o755:
+        os.chmod(folder, 0o755)
+
+
 def _terminate(_sig, _frame):
     raise KeyboardInterrupt
 
@@ -2274,6 +2282,7 @@ def main() -> int:
         if os.geteuid() != 0:
             die("must run as root inside the VM")
         secure_layout()
+        agent_readable()
         return handlers[args.cmd](args, load_config())
     except StError as e:
         if args.json:
