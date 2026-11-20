@@ -76,14 +76,16 @@ IMAGE = set("jpg jpeg png gif bmp webp tif tiff heic".split())
 SIDECAR = set("srt ass ssa sub idx vtt sup nfo txt sfv md5 sha1 sha256 cue log m3u m3u8 xml json".split())
 DOCS = set("pdf epub mobi azw azw3 djvu cbz cbr fb2 docx xlsx pptx odt ods odp rtf md".split())
 MACRO_DOCS = set("docm dotm xlsm xltm xlam pptm potm ppsm doc xls ppt".split())
-ARCHIVES = set("zip rar 7z tar gz tgz bz2 tbz2 xz txz zst lz lzma cab arj".split())
+# aar/yaa (Apple Archive), xip, cpio/cpgz and pax open with a double-click on a Mac.
+ARCHIVES = set("zip rar 7z tar gz tgz bz2 tbz2 xz txz zst lz lzma cab arj aar yaa xip cpio cpgz pax".split())
 DISK_IMAGES = set("iso img bin".split())
 UNPACKABLE_IMAGES = set("iso img dmg".split())  # 7z opens these, so their contents get scanned
-ALWAYS_DANGER = set("lnk scr pif hta vbe jse wsf wsh cpl terminal settingcontent-ms appref-ms".split())
+# .mobileconfig installs a configuration profile: a root certificate, a VPN, device management.
+ALWAYS_DANGER = set("lnk scr pif hta vbe jse wsf wsh cpl terminal settingcontent-ms appref-ms mobileconfig".split())
 EXEC = ALWAYS_DANGER | set(
     "exe msi msp msix appx dll sys com bat cmd ps1 psm1 vbs js reg jar msc chm gadget application "  # Windows
     "dmg pkg mpkg app command tool workflow scpt scptd applescript kext dylib bundle plugin prefpane "
-    "saver osax xpc action fileloc "  # macOS
+    "saver osax xpc action fileloc shortcut framework appex qlgenerator mdimporter sparseimage sparsebundle "  # macOS
     "sh bash zsh run appimage deb rpm so py pl rb desktop apk".split()  # Linux/other
 )
 JUNK = set("url website webloc inetloc".split())
@@ -95,10 +97,18 @@ BIDI_RE = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 SPLIT_PART_RE = re.compile(r"^(r\d\d|z\d\d|\d{3})$")
 
 
+# Folders a Mac treats as one thing: double-clicking runs or mounts them, and Finder hides
+# their contents. Everything inside one counts as that kind of file.
+BUNDLES = ("app", "framework", "bundle", "plugin", "kext", "prefpane", "saver", "xpc", "appex", "qlgenerator",
+           "mdimporter", "workflow", "scptd", "pkg", "mpkg", "sparsebundle")
+
+
 def ext_of(path: str) -> str:
     parts = path.replace("\\", "/").split("/")
-    if any(p.lower().endswith(".app") for p in parts[:-1]):
-        return "app"  # anything inside a macOS .app bundle
+    for p in parts[:-1]:
+        folder_ext = p.lower().rstrip(". ").rsplit(".", 1)[-1] if "." in p.lstrip(".") else ""
+        if folder_ext in BUNDLES:
+            return folder_ext  # anything inside a macOS bundle
     name = parts[-1].rstrip(". ")  # Windows drops trailing dots and spaces: "x.exe." runs as x.exe
     if "." not in name.lstrip("."):
         return ""
