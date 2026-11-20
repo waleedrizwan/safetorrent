@@ -249,6 +249,50 @@ class Settings(ServerBase):
         self.assertEqual(data["settings"]["vt_key_hint"], "…" + GOOD_KEY[-4:])
 
 
+class DownloadFolder(ServerBase):
+    def set_dir(self, value):
+        conf = Path(self.home) / ".config" / "safetorrent"
+        conf.mkdir(parents=True, exist_ok=True)
+        (conf / "config").write_text(f"DOWNLOAD_DIR={value}\n")
+        self.addCleanup((conf / "config").unlink)
+
+    def folder_check(self):
+        status, data, _ = self.request("GET", "/api/state")
+        self.assertEqual(status, 200)
+        return next(c for c in data["health"]["checks"] if c["id"] == "download_dir")
+
+    def test_ready_folder_passes(self):
+        self.set_dir(Path(self.home) / "Downloads" / "SafeTorrents")  # doesn't exist yet: fine
+        self.assertEqual(self.folder_check()["state"], "ok")
+
+    def test_unplugged_drive_warns_without_blocking(self):
+        self.set_dir("/Volumes/No Such Drive st-test/SafeTorrents")
+        check = self.folder_check()
+        self.assertEqual(check["state"], "warn")
+        self.assertIn("No Such Drive st-test isn't connected", check["detail"])
+        self.assertFalse(self.request("GET", "/api/state")[1]["health"]["blocked"])
+
+    def test_unwritable_folder_warns(self):
+        locked = Path(self.home) / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        self.addCleanup(locked.chmod, 0o700)
+        self.set_dir(locked / "SafeTorrents")
+        self.assertIn("can't be written to", self.folder_check()["detail"])
+
+    def test_check_is_not_stored_in_the_vm_health(self):
+        self.request("GET", "/api/state")
+        self.assertEqual(self.srv.State.health["checks"], [])
+
+    def test_open_folder_on_unplugged_drive_explains(self):
+        self.set_dir("/Volumes/No Such Drive st-test/SafeTorrents")
+        with mock.patch.object(self.srv.subprocess, "run") as run:
+            status, data, _ = self.request("POST", "/api/open-downloads", {})
+        self.assertEqual(status, 400)
+        self.assertIn("isn't connected", json.dumps(data))
+        run.assert_not_called()
+
+
 class VpnImport(ServerBase):
     def test_rejects_non_wireguard(self):
         oversized = "[Interface]\nPrivateKey = a\n[Peer]\nEndpoint = 1.2.3.4:1\n# " + "x" * 30000
@@ -471,6 +515,7 @@ class HostileNamesInBrowser(ServerBase):
         out = self.dump_dom()
         self.assertIn('data-act="force-release"', out)
         self.assertNotIn('data-act="release"', out)
+        self.assertIn("Held by your Mac", out)
 
     def test_unvouched_item_offers_only_copy_anyway(self):
         state = hostile_state()
@@ -479,6 +524,18 @@ class HostileNamesInBrowser(ServerBase):
         out = self.dump_dom()
         self.assertIn('data-act="force-release"', out)
         self.assertNotIn('data-act="release"', out)
+
+    def test_failed_auto_copy_offers_a_retry(self):
+        state = hostile_state()
+        item = dict(state["items"][0], name="Film", status="scanned", scan={"verdict": "CLEAN", "findings": []},
+                    release_verdict="CLEAN", auto_release=True)
+        state["items"] = [item]
+        state["errors"] = {item["id"]: "the drive SSD isn't connected"}
+        self.srv.ROUTES[("GET", "/api/state")] = lambda _body: state
+        out = self.dump_dom()
+        self.assertIn('data-act="release"', out)
+        self.assertIn("Copy failed", out)
+        self.assertNotIn("Copying soon", out)
 
     def dump_dom(self) -> str:
         code = self.request("POST", "/api/launch-code", {})[1]["code"]  # as the launcher does

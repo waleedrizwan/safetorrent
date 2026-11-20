@@ -148,6 +148,8 @@ function chambers(m) {
   }
   if (st === "scanned") {
     if (releasing) Object.assign(c[3], { cls: "active indeterminate", state: "Copying" });
+    else if (verdict === "CLEAN" && macHeld(m)) Object.assign(c[3], { cls: "held", state: "Held by your Mac" });
+    else if (verdict === "CLEAN" && S.errors[m.id]) Object.assign(c[3], { cls: "held", state: "Copy failed" });
     else if (verdict === "CLEAN") c[3].state = m.auto_release ? "Copying soon" : "Ready";
     else if (verdict === "WARNING") Object.assign(c[3], { cls: "held", state: "Waiting for you" });
     else Object.assign(c[3], { cls: "fail", state: "Kept in the VM" });
@@ -190,7 +192,8 @@ function actions(m) {
   // check held back: never a plain one-click copy.
   if (st === "scanned" && (HELD.includes(m.release_verdict) || macHeld(m))) out.push(b("force-release", "Copy anyway", "danger"));
   else if (st === "scanned" && v === "WARNING") out.push(b("release", "Copy to my Mac", ""));
-  else if (st === "scanned" && v === "CLEAN" && !m.auto_release) out.push(b("release", "Copy to my Mac", ""));
+  // A failed automatic copy is never retried on its own, so offer it again.
+  else if (st === "scanned" && v === "CLEAN" && (!m.auto_release || S.errors[m.id])) out.push(b("release", "Copy to my Mac", ""));
   if (st === "scanned" && (v === "SUSPICIOUS" || v === "INFECTED")) out.push(b("force-release", "Copy anyway", "danger"));
   if (st === "released") out.push(b("reveal", "Show in Finder", ""), b("release-again", "Copy again"));
   if (["scanned", "released"].includes(st)) out.push(b("scan", "Scan again"));
