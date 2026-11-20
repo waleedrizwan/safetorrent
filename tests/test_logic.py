@@ -143,7 +143,7 @@ class VirusTotalVerdicts(unittest.TestCase):
 
             def lookup(sha, _key):
                 lookups.append(sha)
-                return by_hash.get(sha, ("unknown", None))
+                return (*by_hash.get(sha, ("unknown", None)), {})[:3]
             cfg = dict(st.DEFAULTS, VT_API_KEY=key, VT_MAX_LOOKUPS=limit)
             with mock.patch.object(st, "vt_lookup", lookup), mock.patch.object(st.time, "sleep"):
                 return st.virustotal(d, cfg, category, on_progress=lambda _m: None), lookups
@@ -180,6 +180,20 @@ class VirusTotalVerdicts(unittest.TestCase):
     def test_disguised_program_is_looked_up(self):
         _, lookups = self.scan({"m/movie.mp4": b"MZ-disguised"}, {}, category="media")
         self.assertEqual(len(lookups), 1)
+
+    def test_brand_new_or_long_unchecked_program_is_unvouched(self):
+        now = st.time.time()
+        clean = {"malicious": 0, "undetected": 70}
+        for dates, unvouched in (({"first_seen": now - 2 * 86400, "last_analysis": now}, True),
+                                 ({"first_seen": now - 900 * 86400, "last_analysis": now - 800 * 86400}, True),
+                                 ({"first_seen": now - 900 * 86400, "last_analysis": now - 3 * 86400}, False),
+                                 ({}, False)):
+            with self.subTest(dates):
+                f, _ = self.scan({"app/setup.exe": b"MZ8"}, {"setup.exe": ("found", clean, dates)})
+                self.assertEqual(any(x.get("unvouched") and x["level"] == st.WARN for x in f), unvouched, f)
+        # Only programs: an old archive with no detections is fine.
+        f, _ = self.scan({"app/data.zip": b"PK9"}, {"data.zip": ("found", clean, {"first_seen": now})})
+        self.assertEqual(st.max_level(f), st.INFO)
 
     def test_rejected_key(self):
         f, _ = self.scan({"a/x.exe": b"MZ6"}, {"x.exe": ("badkey", None)})

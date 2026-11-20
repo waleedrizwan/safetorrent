@@ -792,7 +792,7 @@ def vt_key_ok(key: str) -> bool | None:
         state = json.loads(VT_STATE.read_text())
         if state["key"] == fingerprint and time.time() - state["at"] < 86400:
             return state["ok"]
-    status, _ = vt_lookup(EICAR_SHA256, key)
+    status, _, _ = vt_lookup(EICAR_SHA256, key)
     if status in ("error", "ratelimit"):
         return None
     ok = status in ("found", "unknown")
@@ -1206,17 +1206,42 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
     return out
 
 
-def vt_lookup(sha: str, key: str) -> tuple[str, dict | None]:
+VT_TOO_NEW_DAYS = 7     # antivirus engines usually need days to catch up with a new sample
+VT_TOO_OLD_DAYS = 365   # "0 detections" from a scan this old says little about today's signatures
+
+
+def vt_lookup(sha: str, key: str) -> tuple[str, dict | None, dict]:
+    """(status, detection stats, {"first_seen", "last_analysis"} as Unix times when known)."""
     req = urllib.request.Request(f"https://www.virustotal.com/api/v3/files/{sha}", headers={"x-apikey": key})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            stats = json.load(r)["data"]["attributes"]["last_analysis_stats"]
+            attrs = json.load(r)["data"]["attributes"]
+            stats = attrs["last_analysis_stats"]
+            dates = {k: attrs[f] for k, f in (("first_seen", "first_submission_date"),
+                                               ("last_analysis", "last_analysis_date"))
+                     if isinstance(attrs.get(f), int)}
             # A file VT has only just received can come back without results yet.
-            return ("found", stats) if isinstance(stats, dict) else ("error", None)
+            return ("found", stats, dates) if isinstance(stats, dict) else ("error", None, {})
     except urllib.error.HTTPError as e:
-        return {404: "unknown", 401: "badkey", 403: "badkey", 429: "ratelimit"}.get(e.code, "error"), None
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
-        return "error", None
+        return {404: "unknown", 401: "badkey", 403: "badkey", 429: "ratelimit"}.get(e.code, "error"), None, {}
+    except (urllib.error.URLError, TimeoutError, KeyError, TypeError, ValueError):
+        return "error", None, {}
+
+
+def vt_freshness(kind: str, dates: dict) -> str | None:
+    """Why a program's clean VirusTotal result can't vouch for it, if it can't."""
+    if kind != "exec":
+        return None
+
+    def days(t: int) -> float:
+        return (time.time() - t) / 86400
+    if "first_seen" in dates and days(dates["first_seen"]) < VT_TOO_NEW_DAYS:
+        return (f"VirusTotal first saw this program {days(dates['first_seen']):.0f} day(s) ago; too new for "
+                "antivirus engines to have caught up, so no real second opinion")
+    if "last_analysis" in dates and days(dates["last_analysis"]) > VT_TOO_OLD_DAYS:
+        return (f"VirusTotal's clean result is {days(dates['last_analysis']) / 365:.1f} years old; today's "
+                "engines haven't looked at it")
+    return None
 
 
 def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict]:
@@ -1244,7 +1269,7 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
     if len(candidates) > limit:
         out.append(finding(WARN if category == "software" else INFO, "",
                            f"only the {limit} riskiest of {len(candidates)} files were checked on VirusTotal (VT_MAX_LOOKUPS)"))
-    seen: dict[str, tuple[str, dict | None]] = {}
+    seen: dict[str, tuple[str, dict | None, dict]] = {}
     clean = unknown_other = 0
     todo = candidates[:limit]
     for n, (_r, rel, path, kind) in enumerate(todo, 1):
@@ -1256,12 +1281,12 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
         if sha not in seen:
             if seen:
                 time.sleep(15.5)  # free API tier: 4 lookups per minute
-            status, stats = vt_lookup(sha, key)
+            status, stats, dates = vt_lookup(sha, key)
             if status == "ratelimit":
                 time.sleep(61)
-                status, stats = vt_lookup(sha, key)
-            seen[sha] = (status, stats)
-        status, stats = seen[sha]
+                status, stats, dates = vt_lookup(sha, key)
+            seen[sha] = (status, stats, dates)
+        status, stats, dates = seen[sha]
         if status == "badkey":
             print()
             return out + [finding(WARN, "", "VirusTotal rejected the API key; check VT_API_KEY")]
@@ -1283,6 +1308,8 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
                 out.append(finding(DANGER, rel, f"flagged by {bad}/{engines} engines on VirusTotal (could be a false positive; be careful)"))
             elif sus >= 2:
                 out.append(finding(WARN, rel, f"{sus} engines on VirusTotal call it suspicious"))
+            elif vt_freshness(kind, dates):
+                out.append(finding(WARN, rel, str(vt_freshness(kind, dates)), unvouched=True))
             else:
                 clean += 1
     if not on_progress:
