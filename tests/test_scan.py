@@ -564,5 +564,114 @@ class Yara(unittest.TestCase):
         self.assertEqual([json.loads(x)["path"] for x in out.getvalue().splitlines()], [str(root / "Show" / "x.exe")])
 
 
+class Subtitles(unittest.TestCase):
+    def test_srt_keeps_text_and_loses_control_characters(self):
+        srt = b"1\r\n00:00:01,000 --> 00:00:02,000\r\nHello \x1b[31mthere\x07\r\n"
+        self.assertEqual(st.sanitize_subtitle(srt, "srt"), b"1\n00:00:01,000 --> 00:00:02,000\nHello [31mthere\n")
+
+    def test_ass_drops_embedded_fonts_and_pictures(self):
+        ass = (b"[Script Info]\nTitle: x\n\n[V4+ Styles]\nStyle: Default,Arial\n\n[Fonts]\nfontname: evil.ttf\n"
+               b"M8@#$%^\n\n[Graphics]\nfilename: x.png\nABCD\n\n[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hi\n")
+        out = st.sanitize_subtitle(ass, "ass")
+        self.assertNotIn(b"evil.ttf", out)
+        self.assertNotIn(b"x.png", out)
+        self.assertIn(b"Style: Default,Arial", out)
+        self.assertIn(b"Dialogue: 0,0:00:01.00", out)
+
+    def test_other_encodings_are_kept(self):
+        cp1251 = "1\n00:00:01,000 --> 00:00:02,000\nПривет\n".encode("cp1251")
+        self.assertEqual(st.sanitize_subtitle(cp1251, "srt"), cp1251)
+        utf16 = "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\x07\n".encode("utf-16")
+        self.assertEqual(st.sanitize_subtitle(utf16, "srt").decode("utf-16"), "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n")
+
+    def test_huge_lines_are_cut(self):
+        self.assertEqual(len(st.sanitize_subtitle(b"A" * 10**6, "srt")), st.SUB_MAX_LINE)
+
+
+class Disarm(unittest.TestCase):
+    """ffmpeg and the PDF scrubber are stand-ins that write a "rebuilt" file, so this runs anywhere."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        mock.patch.object(st.shutil, "disk_usage", return_value=Usage(0, 0, 500 * GB)).start()
+        self.addCleanup(mock.patch.stopall)
+        self.commands = []
+
+    def put(self, rel, data):
+        p = self.d / "files" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return p
+
+    def fake_run(self, cmd, **kw):
+        self.commands.append(cmd)
+        if cmd[0] == "install":
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        inner = cmd[cmd.index("--") + 1:]
+        if self.fail_on and self.fail_on in " ".join(inner):
+            return subprocess.CompletedProcess(cmd, 1, "", "Invalid data found when processing input")
+        src = inner[-2] if inner[0].endswith("python3") else inner[inner.index("-i") + 1]
+        Path(inner[-1]).write_bytes(b"rebuilt:" + Path(src).read_bytes()[:4])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def disarm(self, fail_on=None):
+        self.fail_on = fail_on
+        with mock.patch.object(st, "run", side_effect=self.fake_run):
+            return st.disarm(self.d)
+
+    def test_media_is_rebuilt_in_place(self):
+        video = self.put("Show/ep1.mkv", b"\x1a\x45\xdf\xa3" + b"\0" * 60)
+        cover = self.put("Show/cover.jpg", b"\xff\xd8\xff\xe0" + b"\0" * 60)
+        pdf = self.put("Show/notes.pdf", b"%PDF-1.7\n")
+        sub = self.put("Show/ep1.srt", b"1\n00:00:01,000 --> 00:00:02,000\nhi\x07\n")
+        text = self.put("Show/readme.txt", b"leave me")
+        out = self.disarm()
+        self.assertEqual(video.read_bytes(), b"rebuilt:\x1a\x45\xdf\xa3")
+        self.assertTrue(cover.read_bytes().startswith(b"rebuilt:"))
+        self.assertTrue(pdf.read_bytes().startswith(b"rebuilt:"))
+        self.assertEqual(sub.read_bytes(), b"1\n00:00:01,000 --> 00:00:02,000\nhi\n")
+        self.assertEqual(text.read_bytes(), b"leave me")
+        self.assertIn("rebuilt 4", out[-1]["msg"])
+        self.assertEqual(oct(video.stat().st_mode & 0o777), "0o644")
+        self.assertFalse((self.d / "disarm").exists())
+        self.assertEqual(sorted(p.name for p in (self.d / "files" / "Show").iterdir()),
+                         ["cover.jpg", "ep1.mkv", "ep1.srt", "notes.pdf", "readme.txt"])  # no temp files left
+        steps = [c for c in self.commands if c[0] == "systemd-run"]
+        self.assertTrue(all("User=torrent" in c and "IPAddressDeny=any" in c for c in steps))
+        ffmpeg = next(c[c.index("--") + 1:] for c in steps if "ffmpeg" in c and "ep1.mkv" in " ".join(c))
+        self.assertNotIn("0:t", " ".join(ffmpeg))  # attachments (fonts) aren't copied
+        self.assertEqual(ffmpeg[ffmpeg.index("-c") + 1], "copy")
+
+    def test_failure_keeps_the_original_and_warns(self):
+        video = self.put("Show/ep1.mkv", b"\x1a\x45\xdf\xa3" + b"\0" * 60)
+        out = self.disarm(fail_on="ep1.mkv")
+        self.assertEqual(video.read_bytes()[:4], b"\x1a\x45\xdf\xa3")
+        self.assertEqual([(f["level"], f["path"]) for f in out], [(st.WARN, "Show/ep1.mkv")])
+        self.assertIn("Invalid data found", out[0]["msg"])
+
+    def test_files_that_arent_what_they_claim_are_left_for_sniff(self):
+        fake = self.put("Show/ep1.mkv", PE)
+        self.assertEqual(self.disarm(), [])
+        self.assertEqual(fake.read_bytes(), PE)
+
+    def test_output_swapped_for_a_symlink_is_refused(self):
+        target = self.put("Show/ep1.mkv", b"\x1a\x45\xdf\xa3")
+        work = self.d / "work"
+        work.mkdir()
+        (work / "out.mkv").symlink_to("/etc/passwd")
+        self.assertFalse(st.take_output(work / "out.mkv", target))
+        self.assertEqual(target.read_bytes(), b"\x1a\x45\xdf\xa3")
+
+    def test_only_media_and_book_torrents_without_a_checksum(self):
+        self.assertTrue(st.disarm_enabled({}, {"category": "media"}))
+        self.assertTrue(st.disarm_enabled({"DISARM_MEDIA": "yes"}, {"category": "docs"}))
+        self.assertFalse(st.disarm_enabled({}, {"category": "software"}))
+        self.assertFalse(st.disarm_enabled({}, {"category": "iso"}))
+        self.assertFalse(st.disarm_enabled({}, {"category": "media", "sha256": "ab" * 32}))
+        self.assertFalse(st.disarm_enabled({"DISARM_MEDIA": "no"}, {"category": "media"}))
+
+
 if __name__ == "__main__":
     unittest.main()

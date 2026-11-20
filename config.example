@@ -24,3 +24,7 @@ STALL_TIMEOUT_MINUTES=15
 METADATA_TIMEOUT_SECONDS=300
 # Largest total size an archive may unpack to for scanning.
 MAX_EXTRACT_GB=50
+# Rebuild videos (remux), pictures, subtitles and PDFs in media/book torrents to strip
+# anything hidden in them: fonts and attachments, metadata, scripts. The copies you get
+# then aren't byte-identical to the torrent's. Never done when you give --sha256.
+DISARM_MEDIA=yes
