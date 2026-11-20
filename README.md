@@ -57,6 +57,10 @@ What's enforced automatically:
 - **Old virus definitions block downloads.** Over 3 days old gives a warning;
   over 7 days blocks downloads.
 - **The firewall is verified on every check,** and rebuilt only if it's wrong.
+- **Copies are checked against the scan.** The scan records every file's SHA-256.
+  The VM sends the files as a tar stream that is unpacked on the Mac in a
+  sandbox (plain files and folders only), and the copy is refused unless it
+  matches that record exactly and the verdict hasn't changed meanwhile.
 
 The app listens only on `127.0.0.1:8765`, and every request needs a secret token
 from `~/.config/safetorrent/gui-token`, so other websites can't control it. The
@@ -109,7 +113,7 @@ isn't passing traffic, download a fresh one.
 | `get <magnet or .torrent> [--category media\|software\|docs\|iso] [--sha256 H] [--yes] [--force] [--no-release]` | Full pipeline (`--no-release` also stops the app from copying it) |
 | `list` | Everything in quarantine and its verdict |
 | `report <id>` | Full findings |
-| `release <id> [--force] [--again]` | Copy to the Mac (`--force` needed for SUSPICIOUS/INFECTED, `--again` if it's already been copied) |
+| `release <id> [--force] [--again]` | Copy to the Mac (`--force` needed for SUSPICIOUS/INFECTED, and for UNSCANNED: a WARNING where part of it couldn't be virus-scanned; `--again` if it's already been copied) |
 | `resume <id>` | Continue a stopped download |
 | `rescan <id>` | Scan again, e.g. after `update` |
 | `purge <id>` / `purge all` | Delete from the VM |
