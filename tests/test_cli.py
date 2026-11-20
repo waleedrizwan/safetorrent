@@ -343,6 +343,13 @@ class Release(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue((self.downloads / "Show" / "Codec_Installer.exe").exists())
 
+    def test_rebuild_asks_first(self):
+        res = subprocess.run([str(ROOT / "safetorrent"), "rebuild"], env=self.env, capture_output=True, text=True,
+                             timeout=30, stdin=subprocess.DEVNULL)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("rebuild --yes", res.stderr)
+        self.assertFalse(any("delete" in c for c in self.calls()))
+
     def test_no_release_when_the_quarantine_flag_cant_be_set(self):
         """Some drives drop extended attributes: an app copied there would open with no Gatekeeper check."""
         fake = self.tmp / "bin" / "xattr"
