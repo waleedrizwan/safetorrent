@@ -194,7 +194,7 @@ STATUSES = {"prechecked", "rejected", "skipped", "queued", "downloading", "incom
             "blocked", "downloaded", "scanning", "scanned", "released", "broken"}
 PRE_VERDICTS = {"OK", "WARNING", "REJECTED"}
 SCAN_VERDICTS = {"CLEAN", "WARNING", "SUSPICIOUS", "INFECTED"}
-RELEASE_VERDICTS = SCAN_VERDICTS | {"UNSCANNED", "-"}
+RELEASE_VERDICTS = SCAN_VERDICTS | {"UNSCANNED", "UNVOUCHED", "-"}
 
 
 def count(v) -> int:

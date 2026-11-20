@@ -112,6 +112,12 @@ class Release(unittest.TestCase):
         self.assertEqual(self.release("scanned", "UNSCANNED", "Show", "--force").returncode, 0)
         self.assertTrue((self.downloads / "Show" / "ep1.mkv").exists())
 
+    def test_unvouched_needs_force(self):
+        res = self.release("scanned", "UNVOUCHED")
+        self.assertIn("no antivirus has a verdict on", res.stderr)
+        self.assert_nothing_copied(res)
+        self.assertEqual(self.release("scanned", "UNVOUCHED", "Show", "--force").returncode, 0)
+
     def test_force_overrides_verdict(self):
         self.assertEqual(self.release("scanned", "INFECTED", "Show", "--force").returncode, 0)
         self.assertTrue((self.downloads / "Show").is_dir())

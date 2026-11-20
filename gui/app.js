@@ -112,6 +112,8 @@ const VERDICT = {
   INFECTED: ["Infected", "bad"], REJECTED: ["Rejected before download", "bad"], OK: ["", ""],
 };
 
+const HELD = ["UNSCANNED", "UNVOUCHED"];
+
 function chambers(m) {
   const pre = m.precheck.verdict;
   const verdict = m.scan && m.scan.verdict;
@@ -183,8 +185,8 @@ function actions(m) {
   if (["queued", "downloading", "scanning"].includes(st)) out.push(b("stop", st === "scanning" ? "Stop scan" : "Pause"));
   if (["incomplete", "vpn-failed", "blocked"].includes(st)) out.push(b("start", "Resume", ""));
   if (st === "downloaded") out.push(b("scan", "Scan now", ""));
-  // Parts nothing could scan: never a plain one-click copy.
-  if (st === "scanned" && m.release_verdict === "UNSCANNED") out.push(b("force-release", "Copy anyway", "danger"));
+  // Parts nothing could scan, or programs nothing vouches for: never a plain one-click copy.
+  if (st === "scanned" && HELD.includes(m.release_verdict)) out.push(b("force-release", "Copy anyway", "danger"));
   else if (st === "scanned" && v === "WARNING") out.push(b("release", "Copy to my Mac", ""));
   if (st === "scanned" && v === "CLEAN" && !m.auto_release) out.push(b("release", "Copy to my Mac", ""));
   if (st === "scanned" && (v === "SUSPICIOUS" || v === "INFECTED")) out.push(b("force-release", "Copy anyway", "danger"));
@@ -349,6 +351,7 @@ $("items").addEventListener("click", async (e) => {
   const m = S.items.find((x) => x.id === id);
   if (act === "delete" && !confirm(`Delete "${m.name}" from quarantine?`)) return;
   const why = m && m.release_verdict === "UNSCANNED" ? "Parts of " + `"${m.name}" couldn't be virus-scanned.`
+    : m && m.release_verdict === "UNVOUCHED" ? `"${m.name}" has programs no antivirus has a verdict on.`
     : m && `The scan flagged "${m.name}" as ${m.scan.verdict.toLowerCase()}.`;
   if (act === "force-release" && !confirm(`${why} Copy it to your Mac anyway?`)) return;
   const map = {
