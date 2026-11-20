@@ -197,7 +197,8 @@ release() {
 
   [[ "$DOWNLOAD_DIR" == /* ]] || die "DOWNLOAD_DIR must be a full path (like ~/Downloads/SafeTorrents), not: $DOWNLOAD_DIR"
   mkdir -p "$DOWNLOAD_DIR"
-  local lock="$DOWNLOAD_DIR/.release-$rid.lock" tmp="$DOWNLOAD_DIR/.incoming-$rid"
+  # .noindex: Spotlight doesn't open files in here while they're still being checked.
+  local lock="$DOWNLOAD_DIR/.release-$rid.lock" tmp="$DOWNLOAD_DIR/.incoming-$rid.noindex"
   local manifest="$DOWNLOAD_DIR/.incoming-$rid.manifest"
   take_lock "$lock" || die "$rid is already being copied to your Mac."
   # shellcheck disable=SC2064  # expand now: the trap runs after these locals are gone
@@ -223,6 +224,15 @@ release() {
   # And the verdict still stands: a rescan may have finished while this was copying.
   [[ "$(guest release-info "$id")" == "$info" ]] || die "the scan result changed while copying; not copying anything. Check it with: safetorrent report $rid"
 
+  # macOS's quarantine flag makes Gatekeeper check any app on first open. Set it before
+  # anything is in place, and if the drive won't keep it, don't release at all: an app
+  # without it would open with no check.
+  local qflag; qflag="0081;$(printf %x "$(date +%s)");safetorrent;"
+  if ! find "$tmp" -exec xattr -s -w com.apple.quarantine "$qflag" {} + \
+     || ! find "$tmp" -exec sh -c 'for p; do xattr -s -p com.apple.quarantine "$p" >/dev/null 2>&1 || exit 1; done' sh {} +; then
+    die "couldn't set macOS's quarantine flag on the copy (the drive holding $DOWNLOAD_DIR may not support it), so Gatekeeper wouldn't check it; not copying anything"
+  fi
+
   # files/ holds the torrent's one top-level folder (or its one file): release that
   # itself rather than a folder of the same name around it.
   local src=$tmp entries
@@ -240,8 +250,6 @@ release() {
   [[ -e "$dest" || -L "$dest" ]] && die "$dest appeared while copying; not overwriting it"
   mv -n "$src" "$dest"
   [[ ! -e "$src" && ! -L "$src" ]] || die "couldn't move the download into place without overwriting something"
-  # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.
-  find "$dest" -exec xattr -s -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
   guest mark-released "$rid" "$dest"
   rm -rf "$tmp" "$manifest" "$lock"; trap - EXIT
   printf '\033[32mReleased:\033[0m %s\n' "$dest"
