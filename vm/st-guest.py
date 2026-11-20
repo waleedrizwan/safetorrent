@@ -313,6 +313,20 @@ def sniff(path: str, head: bytes, category: str = "software") -> list[dict]:
     return []
 
 
+def packed_programs(d: Path) -> list[dict]:
+    """Programs squeezed with UPX: it hides their code from virus scanners until they run,
+    which is why malware uses it. Its marker sits near the start of the file."""
+    out = []
+    for sub in ("files", "extracted"):
+        root = d / sub
+        for rel, _size in walk_files(root) if root.exists() else []:
+            head = read_head(root / rel, 4096)
+            if head.startswith(tuple(m for m, _ in EXEC_MAGIC)) and (b"UPX!" in head or b"UPX0\x00" in head):
+                out.append(finding(WARN, rel, "program packed with UPX, which hides its code from virus scanners "
+                                              "(common in malware, rare in legitimate software)"))
+    return out
+
+
 # ---------------------------------------------------------------- torrents
 
 
@@ -1624,6 +1638,7 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         findings += sniff(rel, read_head(d / "files" / rel), category)
     set_phase(d, meta, "Unpacking archives")
     findings += extract_archives(d, files, d / "files", cfg, category)
+    findings += packed_programs(d)
     # 7z restores the modes stored in the archive, so a file can arrive unreadable
     # (mode 000) and ClamAV, running as the torrent user, would silently skip it.
     # Take extracted/ away from the torrent user and make everything readable, so
