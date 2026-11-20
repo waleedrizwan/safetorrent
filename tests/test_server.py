@@ -355,6 +355,31 @@ def hostile_state():
     }
 
 
+class VmAge(ServerBase):
+    def age_check(self, days_old):
+        lima = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, lima, ignore_errors=True)
+        (lima / "lima.yaml").write_text("x")
+        born = os.stat(lima / "lima.yaml").st_birthtime
+        listing = subprocess.CompletedProcess([], 0, str(lima) + "\n", "")
+        with mock.patch.object(self.srv.subprocess, "run", return_value=listing), \
+             mock.patch.object(self.srv.time, "time", return_value=born + days_old * 86400 + 60):
+            return self.srv.vm_age_check()
+
+    def test_fresh_vm(self):
+        self.assertEqual(self.age_check(3)["state"], "ok")
+
+    def test_old_vm_suggests_a_rebuild(self):
+        check = self.age_check(45)
+        self.assertEqual(check["state"], "warn")
+        self.assertIn("45 days", check["detail"])
+        self.assertIn("safetorrent rebuild", check["detail"])
+
+    def test_missing_vm_adds_nothing(self):
+        with mock.patch.object(self.srv.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            self.assertIsNone(self.srv.vm_age_check())
+
+
 class UntrustedItems(ServerBase):
     """Everything in an item comes from the VM, which a compromised download could control."""
     ID = "abcdef0123"

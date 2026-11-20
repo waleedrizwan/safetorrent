@@ -179,9 +179,30 @@ def set_busy(key: str, label: str | None) -> None:
             State.busy.pop(key, None)
 
 
+VM_MAX_AGE_DAYS = 30
+
+
+def vm_age_check():
+    """How long ago Lima created the VM, measured on the Mac so the VM can't hide it."""
+    res = subprocess.run(["limactl", "list", "--format", "{{.Dir}}", VM], capture_output=True, text=True)
+    try:
+        days = int((time.time() - os.stat(Path(res.stdout.strip()) / "lima.yaml").st_birthtime) // 86400)
+    except (OSError, AttributeError, ValueError):
+        return None
+    if days > VM_MAX_AGE_DAYS:
+        return {"id": "vm_age", "state": "warn", "title": "The VM is due for a rebuild",
+                "detail": f"It's {days} days old; if a download ever took it over, that would still be there. "
+                          "Run `safetorrent rebuild` in Terminal (it empties the quarantine).", "fix": None}
+    return {"id": "vm_age", "state": "ok", "title": "The VM is fresh", "detail": f"Built {days} day(s) ago",
+            "fix": None}
+
+
 def refresh_health() -> None:
     try:
         health = guest("health", timeout=90)
+        age = vm_age_check()
+        if isinstance(health, dict) and isinstance(health.get("checks"), list) and age:
+            health["checks"].append(age)
         with State.lock:
             State.health, State.health_error = health, None
     except ApiError as e:

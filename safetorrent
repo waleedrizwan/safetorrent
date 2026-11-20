@@ -38,6 +38,7 @@ safetorrent: quarantine, scan, then release torrents
   safetorrent update               refresh virus definitions + VM security updates
   safetorrent doctor               check everything is installed
   safetorrent setup                first-time install (VM, config, command)
+  safetorrent rebuild [--yes]      delete the VM (and its quarantine) and build a fresh one
   safetorrent start | stop | shell manage the VM (stop with an id pauses that download)
 EOF
 }
@@ -67,6 +68,39 @@ load_config() {
 }
 
 vm_status() { limactl list --format '{{.Status}}' "$VM" 2>/dev/null || true; }
+
+# Anything that ever took over the VM stays there until it's rebuilt, so suggest that
+# once a month. Measured on the Mac (when Lima created it), so the VM can't hide it.
+VM_MAX_AGE_DAYS=30
+vm_age_days() {
+  local dir born
+  dir=$(limactl list --format '{{.Dir}}' "$VM" 2>/dev/null) && [[ -n "$dir" ]] || return 1
+  born=$(stat -f %B "$dir/lima.yaml" 2>/dev/null) && [[ "$born" =~ ^[0-9]+$ ]] || return 1
+  echo $(( ($(date +%s) - born) / 86400 ))
+}
+
+vm_age_note() {
+  local days
+  days=$(vm_age_days) || return 0
+  if (( days > VM_MAX_AGE_DAYS )); then
+    warn "  ⚠ The VM is $days days old: if a download ever took it over, that would still be there. Rebuild it: safetorrent rebuild"
+  else
+    echo "  ✓ The VM was built $days day(s) ago"
+  fi
+}
+
+cmd_rebuild() {
+  local yes="" answer
+  [[ "${1:-}" == --yes ]] && yes=1
+  echo "This deletes the VM and everything in its quarantine, then builds a fresh one (about 5 minutes)."
+  if [[ -z "$yes" ]]; then
+    [[ -t 0 ]] || die "to rebuild without being asked: safetorrent rebuild --yes"
+    read -r -p "Type rebuild to continue: " answer
+    [[ "$answer" == rebuild ]] || die "not rebuilt"
+  fi
+  if [[ -n "$(vm_status)" ]]; then limactl delete --force "$VM"; fi
+  cmd_setup
+}
 
 ensure_vm() {
   command -v limactl >/dev/null || die "Lima isn't installed. Run: safetorrent setup"
@@ -375,8 +409,15 @@ main() {
     doctor)
       if [[ -x /usr/bin/sandbox-exec ]]; then echo "  ✓ Mac: copies out of the VM are unpacked in a sandbox"
       else warn "  ✖ Mac: sandbox-exec is missing, so nothing can be copied out of the VM"; fi
-      ensure_vm; push; guest doctor ;;
-    vpn|update|health) ensure_vm; push; guest "$cmd" ;;
+      ensure_vm; push; guest doctor; vm_age_note ;;
+    vpn) ensure_vm; push; guest "$cmd" ;;
+    update|health)
+      ensure_vm; push
+      local rc=0
+      guest "$cmd" || rc=$?
+      vm_age_note
+      exit "$rc" ;;
+    rebuild) cmd_rebuild "$@" ;;
     vpn-import) cmd_vpn_import "$@" ;;
     stop-download|pause) ensure_vm; guest stop "${1:?usage: safetorrent $cmd <id>}" ;;
     sync) ensure_vm; push; guest last >/dev/null ;;   # used by the app: hand the VM the current config
