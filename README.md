@@ -38,6 +38,10 @@ install them.) Then optionally:
 - **VirusTotal:** put a free API key in `~/.config/safetorrent/config` as `VT_API_KEY=…`.
 - **Proton VPN:** needs a paid plan and a P2P server. Drop the WireGuard file in
   through the app, or run `safetorrent vpn-import wg0.conf`.
+- **AI review:** set `AI_REVIEW=yes` and `ANTHROPIC_API_KEY=…` to have Claude look
+  over each scan for things no single check catches. It can only add warnings.
+  Each scan sends the file list, the findings and readable text from programs
+  to Anthropic, and costs a few cents.
 
 ## Commands you'll actually use
 
