@@ -17,8 +17,8 @@ safetorrent get "magnet:?xt=urn:btih:…"
 3. In films, shows and books, rebuilds videos, pictures, subtitles and PDFs to
    strip anything hidden in them (attached fonts, metadata, scripts).
 4. Scans everything: real file type vs. extension, unpacks archives and disk
-   images, ClamAV, YARA rules, and hash lookups on VirusTotal and CIRCL
-   hashlookup.
+   images, ClamAV (plus Sanesecurity's malware lists), YARA rules, Windows
+   code signatures, and hash lookups on VirusTotal and CIRCL hashlookup.
 5. Checks the copy again on the Mac (the same rules, plus Apple's code-signing
    checks for any app), then copies clean results to `~/Downloads/SafeTorrents`.
    Anything iffy waits for you; anything bad stays in the VM.
@@ -62,8 +62,8 @@ scanner, and cracked software is risky no matter what. Once you open a file on
 your Mac, you're trusting the scan. A few specifics:
 
 - A program nothing vouches for (VirusTotal has never seen it, or saw it only
-  days ago; it isn't a known published file; an app isn't signed and notarized)
-  is held as UNVOUCHED. That's what brand-new malware looks like. Copy it only
+  days ago; it isn't a known published file; it has no valid, unrevoked
+  signature from a publisher Windows or Apple trusts) is held as UNVOUCHED. That's what brand-new malware looks like. Copy it only
   if you trust where it came from: `safetorrent release <id> --force`.
 - Rebuilt media isn't byte-identical to the torrent's, so you can't seed it
   back. `DISARM_MEDIA=no` in the config keeps the originals.
