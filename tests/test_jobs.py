@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -225,6 +226,31 @@ class ReleaseState(Base):
         # Otherwise a rescan makes it look new, and the app or CLI copies it again.
         self.assertEqual(self.scan(released_to="/Users/me/Downloads/SafeTorrents/Show"), "released")
         self.assertEqual(self.scan(), "scanned")
+
+
+class SpecialFiles(Base):
+    def test_symlink_in_files_is_danger(self):
+        """walk_files skips symlinks, so nothing would scan one, yet it would be copied to the Mac."""
+        d = self.make(status="downloaded", category="media")
+        (d / "files" / "Show").mkdir(parents=True)
+        (d / "files" / "Show" / "ep1.mkv").write_bytes(b"\x1a\x45\xdf\xa3video")
+        (d / "files" / "Show" / "link").symlink_to("/etc/passwd")
+        (d / "files" / "Show" / "dirlink").symlink_to("/etc")
+        with mock.patch.multiple(st, run=mock.DEFAULT, ensure_firewall=mock.DEFAULT,
+                                 extract_archives=mock.Mock(return_value=[]),
+                                 clamav_scan=mock.Mock(return_value=[]), virustotal=mock.Mock(return_value=[])):
+            st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
+        scan_ = st.load_meta(d)["scan"]
+        danger = {f["path"] for f in scan_["findings"] if f["level"] == st.DANGER}
+        self.assertEqual(danger, {"Show/link", "Show/dirlink"})
+        self.assertEqual(scan_["verdict"], "SUSPICIOUS")
+
+    def test_fifo_is_special(self):
+        root = self.tmp / "f"
+        root.mkdir()
+        os.mkfifo(root / "pipe")
+        (root / "ok.txt").write_text("x")
+        self.assertEqual(st.special_entries(root), ["pipe"])
 
 
 class Update(unittest.TestCase):

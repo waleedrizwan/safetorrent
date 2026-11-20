@@ -201,6 +201,10 @@ release() {
   trap "rm -rf $(printf %q "$tmp") $(printf %q "$lock")" EXIT
   rm -rf "$tmp"; mkdir "$tmp"
   limactl copy --backend=rsync -r "$VM:/srv/quarantine/$rid/files/" "$tmp/" >/dev/null
+  # rsync -a (what Lima runs) keeps symlinks, special files and modes. A symlink
+  # could point at ~/.ssh or ~/Library, and nothing in the VM scanned it.
+  [[ -z "$(find "$tmp" ! -type f ! -type d -print -quit)" ]] || die "the copy contained symlinks or special files; not copying anything"
+  chmod -R u+rwX,go-w,ug-s "$tmp"   # no setuid/setgid, nothing others can change
 
   # files/ holds the torrent's one top-level folder (or its one file): release that
   # itself rather than a folder of the same name around it.
@@ -220,7 +224,7 @@ release() {
   mv -n "$src" "$dest"
   [[ ! -e "$src" && ! -L "$src" ]] || die "couldn't move the download into place without overwriting something"
   # Re-apply macOS's quarantine flag so Gatekeeper still checks any app on first open.
-  find "$dest" -exec xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
+  find "$dest" -exec xattr -s -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");safetorrent;" {} + 2>/dev/null || true
   guest mark-released "$rid" "$dest"
   rm -rf "$tmp" "$lock"; trap - EXIT
   printf '\033[32mReleased:\033[0m %s\n' "$dest"

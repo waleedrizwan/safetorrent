@@ -2,6 +2,7 @@
 Runs the real bash script against a fake `limactl` that plays the VM."""
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ case "$1" in
   list) echo Running ;;
   copy)
     src=${@: -2:1}; dst=${@: -1}
-    sleep "${FAKE_SLEEP:-0}"; cp -R "$FAKE_VM_FILES/." "$dst" ;;
+    sleep "${FAKE_SLEEP:-0}"; cp -Rp "$FAKE_VM_FILES/." "$dst" ;;  # keeps links and modes, like rsync -a
   shell)
     while [[ "$1" != st-guest ]]; do shift; done; shift
     case "$1" in
@@ -206,6 +207,28 @@ class Release(unittest.TestCase):
             cwd=self.tmp, capture_output=True, text=True, timeout=30)
         self.assertIn("full path", res.stderr)
         self.assertFalse((self.tmp / "Downloads").exists())
+
+    def assert_special_refused(self):
+        res = self.release("scanned", "CLEAN")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("symlinks or special files", res.stderr)
+        self.assertFalse(any("mark-released" in c for c in self.calls()))
+        self.assertEqual(list(self.downloads.iterdir()), [])  # no Show, no .incoming-*, no lock
+
+    def test_symlink_in_the_copy_is_refused(self):
+        (self.home / ".ssh").mkdir()
+        os.symlink(self.home / ".ssh", self.vm_files / "Show" / "Subs")
+        self.assert_special_refused()
+
+    def test_fifo_in_the_copy_is_refused(self):
+        os.mkfifo(self.vm_files / "Show" / "pipe")
+        self.assert_special_refused()
+
+    def test_setuid_and_group_write_are_stripped(self):
+        os.chmod(self.vm_files / "Show" / "ep1.mkv", 0o6777)
+        self.assertEqual(self.release("scanned", "CLEAN").returncode, 0)
+        mode = os.stat(self.downloads / "Show" / "ep1.mkv").st_mode
+        self.assertEqual(mode & (stat.S_ISUID | stat.S_ISGID | stat.S_IWGRP | stat.S_IWOTH), 0)
 
     @unittest.skipUnless(sys.platform == "darwin", "Gatekeeper's quarantine flag is macOS-only")
     def test_every_file_gets_gatekeeper_quarantine_flag(self):

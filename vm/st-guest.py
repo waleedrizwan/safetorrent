@@ -484,6 +484,19 @@ def walk_files(root: Path) -> list[tuple[str, int]]:
     return sorted(out)
 
 
+def special_entries(root: Path) -> list[str]:
+    """Symlinks, FIFOs, sockets and devices: walk_files skips them, so nothing scans
+    them, and they must never reach the Mac."""
+    out = []
+    for dirpath, dirs, names in os.walk(root):  # doesn't follow links to folders
+        for n in dirs + names:
+            p = Path(dirpath) / n
+            mode = p.lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                out.append(str(p.relative_to(root)))
+    return sorted(out)
+
+
 def open_nofollow(path: Path):
     """Open a file the torrent user can write to, refusing symlinks, FIFOs and devices."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -1200,6 +1213,8 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     category = meta["category"]
     set_phase(d, meta, "Checking what each file really is")
     findings = check_names(files, category, meta["name"])
+    findings += [finding(DANGER, rel, "symlink or special file: not scanned, and won't be copied to your Mac")
+                 for rel in special_entries(d / "files")]
     for rel, _ in files:
         findings += sniff(rel, read_head(d / "files" / rel), category)
     set_phase(d, meta, "Unpacking archives")
