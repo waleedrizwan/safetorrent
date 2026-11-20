@@ -1,6 +1,7 @@
 """Unit tests for the guest agent's parsing and rules (run on any machine)."""
 import hashlib
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -181,6 +182,20 @@ class Sniff(unittest.TestCase):
     def test_program_disguised_as_a_web_page_or_macro_doc(self):
         for path in ("index.html", "report.docm"):
             self.assertEqual(st.max_level(st.sniff(path, b"\x7fELF\x02\x01")), st.DANGER, path)
+
+
+class Packed(unittest.TestCase):
+    def test_upx_packed_programs_get_a_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for rel, data in {"files/T/packed.exe": b"MZ\x90\x00" + b"\0" * 400 + b"UPX0\x00\x00UPX1\x00" + b"UPX!",
+                              "extracted/a.zip.d/elf": b"\x7fELF" + b"\0" * 100 + b"UPX!",
+                              "files/T/plain.exe": b"MZ\x90\x00" + b"\0" * 400,
+                              "files/T/readme.txt": b"we use UPX! to pack things"}.items():
+                (d / rel).parent.mkdir(parents=True, exist_ok=True)
+                (d / rel).write_bytes(data)
+            found = st.packed_programs(d)
+        self.assertEqual(sorted((f["path"], f["level"]) for f in found), [("T/packed.exe", st.WARN), ("a.zip.d/elf", st.WARN)])
 
 
 class MacAndWindowsTricks(unittest.TestCase):
