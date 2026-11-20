@@ -38,7 +38,7 @@ provision:
     apt-get update
     apt-get install -y --no-install-recommends \
       aria2 clamav clamav-freshclam 7zip 7zip-rar file python3 \
-      wireguard-tools iptables curl ca-certificates
+      wireguard-tools iptables curl ca-certificates ffmpeg python3-pikepdf python3-yara
     # Root owns the state and quarantine folders; the torrent user gets only its
     # home here and, per download, the files/ and extracted/ folders.
     install -d -m 755 /var/lib/safetorrent /srv/quarantine
