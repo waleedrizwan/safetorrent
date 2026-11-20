@@ -93,6 +93,8 @@ WEB = set("html htm shtml xhtml mht mhtml svg".split())  # open in a browser, wh
 MEDIA_KINDS = {"video", "audio", "image"}
 
 QUALITY_RE = re.compile(r"(?i)(2160p|1080p|720p|\b4k\b|uhd|blu-?ray|bdrip|web-?dl|webrip|remux)")
+EPISODE_RE = re.compile(r"(?i)\bS\d{1,2}E\d{1,3}\b")
+FULL_VIDEO = 100 * 1024**2  # a real film or episode, not a sample or a trailer
 BIDI_RE = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 SPLIT_PART_RE = re.compile(r"^(r\d\d|z\d\d|\d{3})$")
 
@@ -141,14 +143,30 @@ def kind_of(ext: str) -> str:
     return "other"
 
 
-def detect_category(files: list[tuple[str, int]]) -> str:
+def looks_like_a_release(name: str) -> bool:
+    return bool(QUALITY_RE.search(name) or EPISODE_RE.search(name))
+
+
+def detect_category(files: list[tuple[str, int]], torrent_name: str = "") -> str:
     total = sum(s for _, s in files) or 1
     by_kind: dict[str, int] = {}
     for path, size in files:
         k = kind_of(ext_of(path))
         by_kind[k] = by_kind.get(k, 0) + size
-    if sum(by_kind.get(k, 0) for k in MEDIA_KINDS) / total >= 0.7:
+    media_share = sum(by_kind.get(k, 0) for k in MEDIA_KINDS) / total
+    if media_share >= 0.7:
         return "media"
+    # Padding (a big .bin or junk file) can push a film under 70% so that its "codec
+    # installer" is judged as ordinary software. It's still a film when the torrent is named
+    # like a release and holds a full-length video, or when a video is the biggest file and
+    # media is a large share.
+    videos = [f for f in files if kind_of(ext_of(f[0])) == "video"]
+    if videos:
+        biggest_video = max(videos, key=lambda f: f[1])
+        if biggest_video[1] >= FULL_VIDEO and looks_like_a_release(torrent_name):
+            return "media"
+        if biggest_video[1] == max(s for _, s in files) and media_share >= 0.4:
+            return "media"
     if (by_kind.get("doc", 0) + by_kind.get("macro", 0)) / total >= 0.7:
         return "docs"
     if by_kind.get("disk", 0) / total >= 0.7:
@@ -203,6 +221,10 @@ def check_names(files: list[tuple[str, int]], category: str, torrent_name: str =
             out.append(finding(WARN, path, "mentions a password; password-protected archives can't be virus-scanned"))
     if programs:
         out.append(finding(INFO, "", f"{len(programs)} program file(s), expected for software; each will be scanned"))
+        films = [p for p, s in files if kind_of(ext_of(p)) == "video" and s >= FULL_VIDEO]
+        if films:
+            out.append(finding(WARN, films[0], "a full-length video alongside programs: a common trick is a "
+                                               "film that asks you to install a \"codec\" or \"player\""))
     if category == "media":
         videos = [(p, s) for p, s in files if kind_of(ext_of(p)) == "video"]
         if videos:
@@ -1400,7 +1422,7 @@ def precheck(src: Path, cfg: dict, category: str | None, sha256: str | None,
     if sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", sha256.strip()):
         die("that checksum isn't a SHA-256 (64 hex characters)")
     auto_category = category is None
-    category = category or detect_category(info["files"])
+    category = category or detect_category(info["files"], info["name"])
     findings = check_names(info["files"], category, info["name"])
     level = max_level(findings)
     d.mkdir(mode=0o755, exist_ok=True)  # root's: only files/ is the torrent user's
