@@ -97,7 +97,9 @@ def setUpModule():
     conf_dir = tmp / "home" / ".config" / "safetorrent"
     conf_dir.mkdir(parents=True)
     conf = (REAL_CONF_DIR / "config").read_text() if (REAL_CONF_DIR / "config").exists() else ""
-    conf = re.sub(r"(?m)^\s*DOWNLOAD_DIR=.*\n?", "", conf) + f"\nDOWNLOAD_DIR={released}\n"
+    # Media rebuilding is off except in its own test, so the others can compare released
+    # files byte for byte with the torrents'.
+    conf = re.sub(r"(?m)^\s*(DOWNLOAD_DIR|DISARM_MEDIA)=.*\n?", "", conf) + f"\nDOWNLOAD_DIR={released}\nDISARM_MEDIA=no\n"
     (conf_dir / "config").write_text(conf)
     (conf_dir / "config").chmod(0o600)
     if (REAL_CONF_DIR / "wg0.conf").exists():
@@ -280,6 +282,30 @@ class LocalTorrents(unittest.TestCase):
             attr = sh(["xattr", "-p", "com.apple.quarantine", str(dest / rel)], check=False)
             self.assertIn("safetorrent", attr.stdout, f"{rel} has no Gatekeeper quarantine flag")
         self.assertEqual(item(meta["id"])["status"], "released")
+
+    def test_media_is_rebuilt_without_hidden_extras(self):
+        conf = tmp / "home" / ".config" / "safetorrent" / "config"
+        original = conf.read_text()
+        conf.write_text(original.replace("DISARM_MEDIA=no", "DISARM_MEDIA=yes"))
+        self.addCleanup(conf.write_text, original)
+        meta = self.run_fixture("st-e2e-real-media")
+        self.assertEqual(meta["category"], "media")
+        self.assertEqual(meta["scan"]["verdict"], "CLEAN", self.output)
+        self.assertTrue(any("rebuilt 3" in f["msg"] for f in meta["scan"]["findings"]), meta["scan"]["findings"])
+        files = f"/srv/quarantine/{meta['id']}/files/ST-E2E Real Media"
+        streams = vm(f"ffprobe -v error -show_entries stream=codec_type -of csv=p=0 '{files}/episode.mkv'").stdout.split()
+        self.assertEqual(sorted(streams), ["audio", "video"])  # the attached font is gone
+        pdf = vm("python3 -c 'import pikepdf, sys; p = pikepdf.open(sys.argv[1]); "
+                 "print(len(p.pages), \"/OpenAction\" in p.Root, \"/EmbeddedFiles\" in p.Root.get(\"/Names\", {}))' "
+                 f"'{files}/notes.pdf'").stdout.split()
+        self.assertEqual(pdf, ["1", "False", "False"])
+        self.assertNotIn("[Fonts]", vm(f"cat '{files}/episode.ass'").stdout)
+
+        st("release", meta["id"])
+        dest = released / meta["name"]
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["episode.ass", "episode.mkv", "notes.pdf"])
+        original_hash = manifest["st-e2e-real-media"]["files"]["episode.mkv"]
+        self.assertNotEqual(sh(["shasum", "-a", "256", str(dest / "episode.mkv")]).stdout.split()[0], original_hash)
 
     def test_nothing_runs_as_torrent_after_a_download(self):
         """Every step runs in a unit that systemd tears down, so nothing can keep writing after the scan."""
