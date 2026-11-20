@@ -173,9 +173,18 @@ class VirusTotalVerdicts(unittest.TestCase):
         self.assertEqual({x["path"]: bool(x.get("unvouched")) for x in f if x["level"] >= st.WARN},
                          {"app/new.exe": True, "app/bad.exe": False})
 
-    def test_media_is_not_looked_up(self):
-        _, lookups = self.scan({"m/movie.mkv": b"\x1a\x45\xdf\xa3", "m/movie.srt": b"1"}, {})
-        self.assertEqual(lookups, [])
+    def test_only_the_biggest_media_file_is_looked_up(self):
+        files = {"m/movie.mkv": b"\x1a\x45\xdf\xa3" * 4, "m/sample.mkv": b"\x1a\x45\xdf\xa3", "m/movie.srt": b"1"}
+        _, lookups = self.scan(files, {})
+        self.assertEqual(lookups, [st.hashlib.sha256(files["m/movie.mkv"]).hexdigest()])
+
+    def test_known_bad_media_file_is_flagged(self):
+        f, _ = self.scan({"m/movie.mkv": b"\x1a\x45\xdf\xa3bad"},
+                         {"movie.mkv": ("found", {"malicious": 12, "undetected": 50})}, category="media")
+        self.assertEqual(st.max_level(f), st.INFECTED)
+        # Never seen is normal for a video: no warning.
+        f, _ = self.scan({"m/movie.mkv": b"\x1a\x45\xdf\xa3new"}, {}, category="media")
+        self.assertEqual(st.max_level(f), st.INFO)
 
     def test_disguised_program_is_looked_up(self):
         _, lookups = self.scan({"m/movie.mp4": b"MZ-disguised"}, {}, category="media")
