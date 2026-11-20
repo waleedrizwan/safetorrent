@@ -221,6 +221,20 @@ release() {
   # Exactly the bytes that were scanned: nothing changed, added or left out since.
   echo "Verifying…"
   /usr/bin/python3 -I "$ROOT/host/verify_manifest.py" "$tmp" "$manifest" || die "not copying anything"
+  # The verdict above came from the VM, and a VM something took over could lie. Check
+  # again here with this Mac's own rules and macOS's code-signing tools. Same sandbox:
+  # it reads the copy but can't write outside it or use the network.
+  echo "Checking it on your Mac too…"
+  local held first
+  if ! held=$(/usr/bin/sandbox-exec -f "$ROOT/host/receive.sb" -D STAGE="$stage" \
+              /usr/bin/python3 -I "$ROOT/host/recheck.py" "$stage" "$name" 2>&1); then
+    printf '%s\n' "$held" >&2
+    first=$(printf '%s\n' "$held" | grep -m1 '✖' | sed 's/^ *✖ //' || true)
+    [[ -n "$force" ]] || die "your Mac's own check held it back: ${first:-see above}; not copying anything. (Override: safetorrent release $rid --force)"
+    warn "Copying anyway (--force)."
+  elif [[ -n "$held" ]]; then
+    printf '%s\n' "$held"
+  fi
   # And the verdict still stands: a rescan may have finished while this was copying.
   [[ "$(guest release-info "$id")" == "$info" ]] || die "the scan result changed while copying; not copying anything. Check it with: safetorrent report $rid"
 
