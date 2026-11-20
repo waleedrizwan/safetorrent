@@ -69,6 +69,7 @@ DEFAULTS = {
     "STALL_TIMEOUT_MINUTES": "15",
     "METADATA_TIMEOUT_SECONDS": "300",
     "MAX_EXTRACT_GB": "50",
+    "HASHLOOKUP": "yes",
 }
 
 # ---------------------------------------------------------------- file kinds
@@ -1411,18 +1412,18 @@ def vt_freshness(kind: str, dates: dict) -> str | None:
     return None
 
 
-def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict]:
-    key = cfg["VT_API_KEY"]
-    if not key:
-        return [finding(INFO, "", "VirusTotal check skipped (no VT_API_KEY in ~/.config/safetorrent/config)")]
-    rank = {"exec": 0, "macro": 1, "archive": 2, "disk": 3, "doc": 4, "media": 5}
+VT_RANK = {"exec": 0, "macro": 1, "archive": 2, "disk": 3, "doc": 4, "media": 5}
+
+
+def vt_candidates(d: Path) -> list[tuple[int, str, Path, str]]:
+    """(rank, path, file, kind) for every file worth a second opinion, riskiest first."""
     candidates = []
     # The biggest video, song or picture too: campaigns that booby-trap media files reuse
     # them, and one lookup is cheap. Matched by hash, so a media file never needs uploading.
     media = [(s, r) for r, s in walk_files(d / "files") if kind_of(ext_of(r)) in MEDIA_KINDS and s > 0]
     if media:
         _size, rel = max(media)
-        candidates.append((rank["media"], rel, d / "files" / rel, "media"))
+        candidates.append((VT_RANK["media"], rel, d / "files" / rel, "media"))
     for sub in ("files", "extracted"):
         root = d / sub
         if not root.exists():
@@ -1432,16 +1433,29 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
             head = read_head(root / rel, 16)
             if any(head.startswith(m) for m, _ in EXEC_MAGIC):
                 kind = "exec"
-            if kind in rank and size > 0:
-                candidates.append((rank[kind], rel, root / rel, kind))
+            if kind in VT_RANK and size > 0:
+                candidates.append((VT_RANK[kind], rel, root / rel, kind))
+    return sorted(candidates)
+
+
+def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict]:
+    key = cfg["VT_API_KEY"]
+    candidates = vt_candidates(d)
+    if not key:
+        # Nothing else gives a second opinion on a program, so none is vouched for
+        # (hashlookup_vouch() may still recognise some as published software).
+        return [finding(INFO, "", "VirusTotal check skipped (no VT_API_KEY in ~/.config/safetorrent/config)")] + [
+            finding(WARN, rel, "no second opinion on this program: VirusTotal isn't set up", unvouched=True)
+            for _r, rel, _p, kind in candidates if kind == "exec"]
     if not candidates:
         return []
-    candidates.sort()
     limit = int(cfg["VT_MAX_LOOKUPS"])
     out: list[dict] = []
     if len(candidates) > limit:
         out.append(finding(WARN if category == "software" else INFO, "",
                            f"only the {limit} riskiest of {len(candidates)} files were checked on VirusTotal (VT_MAX_LOOKUPS)"))
+        out += [finding(WARN, rel, "not looked up on VirusTotal (past VT_MAX_LOOKUPS), so no second opinion",
+                        unvouched=True) for _r, rel, _p, kind in candidates[limit:] if kind == "exec"]
     seen: dict[str, tuple[str, dict | None, dict]] = {}
     clean = unknown_other = 0
     todo = candidates[:limit]
@@ -1491,6 +1505,65 @@ def virustotal(d: Path, cfg: dict, category: str, on_progress=None) -> list[dict
         out.append(finding(INFO, "", f"{clean} file(s) known to VirusTotal with zero detections"))
     if unknown_other:
         out.append(finding(INFO, "", f"{unknown_other} archive/document file(s) not yet seen by VirusTotal"))
+    return out
+
+
+HASHLOOKUP_URL = "https://hashlookup.circl.lu/bulk/sha1"
+HASHLOOKUP_BATCH = 100
+
+
+def sha1_file(path: Path) -> str:
+    h = hashlib.sha1()
+    with open_nofollow(path) as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def hashlookup(sha1s: list[str]) -> dict[str, dict] | None:
+    """CIRCL hashlookup's records for the hashes it knows (SHA-1, upper case), or None if
+    it couldn't be reached. It indexes NSRL (the US government's library of published
+    software) and Linux distributions, and notes files known to be malicious."""
+    known: dict[str, dict] = {}
+    for i in range(0, len(sha1s), HASHLOOKUP_BATCH):
+        body = json.dumps({"hashes": sha1s[i:i + HASHLOOKUP_BATCH]}).encode()
+        req = urllib.request.Request(HASHLOOKUP_URL, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                records = json.load(r)
+        except (OSError, ValueError):
+            return None
+        for rec in records if isinstance(records, list) else []:
+            if isinstance(rec, dict) and isinstance(rec.get("SHA-1"), str):
+                known[rec["SHA-1"].upper()] = rec
+    return known
+
+
+def hashlookup_vouch(d: Path, findings: list[dict], cfg: dict) -> list[dict]:
+    """For programs nothing vouched for: a file NSRL records as part of published software
+    is vouched for; one hashlookup lists as known malware is flagged. Returns new findings."""
+    if cfg.get("HASHLOOKUP", "yes").lower() not in ("yes", "true", "1"):
+        return []
+    waiting = [f for f in findings if f.get("unvouched") and f["level"] == WARN and f["path"]]
+    by_hash: dict[str, list[dict]] = {}
+    for f in waiting:
+        path = next((p for p in (d / "files" / f["path"], d / "extracted" / f["path"]) if p.is_file()), None)
+        if path:
+            by_hash.setdefault(sha1_file(path).upper(), []).append(f)
+    if not by_hash:
+        return []
+    known = hashlookup(sorted(by_hash))
+    if known is None:
+        return [finding(INFO, "", "CIRCL hashlookup couldn't be reached, so it couldn't vouch for any programs")]
+    out: list[dict] = []
+    for sha, rec in known.items():
+        for f in by_hash.get(sha, []):
+            if rec.get("KnownMalicious"):
+                out.append(finding(DANGER, f["path"], f"listed as known malware ({rec['KnownMalicious']}) by CIRCL hashlookup"))
+            elif "RDS:package_id" in rec or "ProductCode" in rec:  # NSRL, not a user-uploaded package
+                product = rec.get("ProductCode", {}).get("ProductName", "") if isinstance(rec.get("ProductCode"), dict) else ""
+                f.update(level=INFO, msg=f["msg"] + "; but NSRL lists it as a published file"
+                         + (f" ({product})" if product else ""))
     return out
 
 
@@ -1573,6 +1646,9 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         set_phase(d, meta, "Checking the publisher's checksum")
         findings += verify_checksum(d, meta["sha256"])
         trust_checksum(findings)
+    # After the checksum, so only programs nothing else vouched for are looked up.
+    set_phase(d, meta, "Known-software lookup (CIRCL hashlookup)")
+    findings += hashlookup_vouch(d, findings, cfg)
     set_phase(d, meta, "Recording what was scanned")
     manifest = write_manifest(d)
     level = max_level(findings)

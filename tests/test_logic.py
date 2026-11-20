@@ -218,10 +218,66 @@ class VirusTotalVerdicts(unittest.TestCase):
         self.assertEqual(len(lookups), 2)
         self.assertTrue(any("only the 2 riskiest of 5" in x["msg"] for x in f))
 
-    def test_no_key_skips(self):
-        f, lookups = self.scan({"a/x.exe": b"MZ"}, {}, key="")
+    def test_no_key_skips_and_leaves_programs_unvouched(self):
+        f, lookups = self.scan({"a/x.exe": b"MZ", "a/notes.pdf": b"%PDF"}, {}, key="")
         self.assertEqual(lookups, [])
         self.assertIn("skipped", f[0]["msg"])
+        self.assertEqual([(x["path"], x["level"]) for x in f if x.get("unvouched")], [("a/x.exe", st.WARN)])
+
+    def test_programs_past_the_lookup_cap_are_unvouched(self):
+        files = {f"a/{i}.exe": f"MZ{i}".encode() for i in range(3)}
+        clean = ("found", {"malicious": 0, "undetected": 70})
+        f, _ = self.scan(files, {f"{i}.exe": clean for i in range(3)}, limit="1")
+        self.assertEqual(len([x for x in f if x.get("unvouched")]), 2)
+
+
+class HashLookup(unittest.TestCase):
+    def vouch(self, files: dict, records, cfg=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for rel, data in files.items():
+                (d / "files" / rel).parent.mkdir(parents=True, exist_ok=True)
+                (d / "files" / rel).write_bytes(data)
+            findings = [st.finding(st.WARN, rel, "never seen", unvouched=True) for rel in files]
+            sent = []
+
+            def lookup(sha1s):
+                sent.extend(sha1s)
+                if records is None:
+                    return None
+                return {st.hashlib.sha1(files[r]).hexdigest().upper(): rec for r, rec in records.items()}
+            with mock.patch.object(st, "hashlookup", side_effect=lookup):
+                new = st.hashlookup_vouch(d, findings, cfg or {})
+            return findings, new, sent
+
+    def test_nsrl_file_is_vouched(self):
+        rec = {"RDS:package_id": "1", "ProductCode": {"ProductName": "7-Zip 23"}}
+        findings, new, _ = self.vouch({"a/7z.exe": b"MZ7z"}, {"a/7z.exe": rec})
+        self.assertEqual((findings[0]["level"], new), (st.INFO, []))
+        self.assertIn("7-Zip 23", findings[0]["msg"])
+
+    def test_known_malware_is_flagged_even_if_also_in_nsrl(self):
+        rec = {"RDS:package_id": "1", "KnownMalicious": "malshare.com"}
+        findings, new, _ = self.vouch({"a/eicar.com": b"X5O"}, {"a/eicar.com": rec})
+        self.assertEqual(findings[0]["level"], st.WARN)
+        self.assertEqual([(x["level"], x["path"]) for x in new], [(st.DANGER, "a/eicar.com")])
+
+    def test_user_uploaded_packages_dont_vouch(self):
+        findings, _, _ = self.vouch({"a/tool": b"\x7fELF"}, {"a/tool": {"source": "snap:abc"}})
+        self.assertEqual(findings[0]["level"], st.WARN)
+
+    def test_unreachable_leaves_everything_unvouched(self):
+        findings, new, _ = self.vouch({"a/x.exe": b"MZx"}, None)
+        self.assertEqual(findings[0]["level"], st.WARN)
+        self.assertIn("couldn't be reached", new[0]["msg"])
+
+    def test_can_be_turned_off(self):
+        _, _, sent = self.vouch({"a/x.exe": b"MZx"}, {}, cfg={"HASHLOOKUP": "no"})
+        self.assertEqual(sent, [])
+
+    def test_only_sends_hashes_of_unvouched_programs(self):
+        _, _, sent = self.vouch({"a/x.exe": b"MZx"}, {})
+        self.assertEqual(sent, [st.hashlib.sha1(b"MZx").hexdigest().upper()])
 
 
 class Verdicts(unittest.TestCase):

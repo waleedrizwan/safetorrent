@@ -5,6 +5,9 @@
 VT_API_KEY=
 # Max files looked up per torrent (free tier = 4/minute, so 20 takes ~5 min).
 VT_MAX_LOOKUPS=20
+# Ask CIRCL hashlookup (free, no key) about programs VirusTotal couldn't vouch for: it
+# knows published software (NSRL) and some known malware. Sends those files' SHA-1s.
+HASHLOOKUP=yes
 
 # Route torrent traffic through WireGuard with a kill switch.
 # Put your config at ~/.config/safetorrent/wg0.conf first (see README).
