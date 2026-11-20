@@ -230,7 +230,10 @@ release() {
   esac
 
   [[ "$DOWNLOAD_DIR" == /* ]] || die "DOWNLOAD_DIR must be a full path (like ~/Downloads/SafeTorrents), not: $DOWNLOAD_DIR"
-  mkdir -p "$DOWNLOAD_DIR"
+  if [[ "$DOWNLOAD_DIR" =~ ^/Volumes/([^/]+) ]] && [[ ! -d "/Volumes/${BASH_REMATCH[1]}" ]]; then
+    die "the drive ${BASH_REMATCH[1]} isn't connected, so $DOWNLOAD_DIR isn't available. Connect it, or change DOWNLOAD_DIR; $rid stays in quarantine."
+  fi
+  mkdir -p "$DOWNLOAD_DIR" 2>/dev/null || die "can't create $DOWNLOAD_DIR; $rid stays in quarantine."
   # .noindex: Spotlight doesn't open files in here while they're still being checked.
   local lock="$DOWNLOAD_DIR/.release-$rid.lock" tmp="$DOWNLOAD_DIR/.incoming-$rid.noindex"
   local manifest="$DOWNLOAD_DIR/.incoming-$rid.manifest"

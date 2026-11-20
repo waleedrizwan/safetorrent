@@ -242,6 +242,16 @@ class Release(unittest.TestCase):
         self.assertIn("full path", res.stderr)
         self.assertFalse((self.tmp / "Downloads").exists())
 
+    def test_unplugged_drive_named_in_the_error(self):
+        conf = self.home / ".config" / "safetorrent"
+        conf.mkdir(parents=True)
+        (conf / "config").write_text("DOWNLOAD_DIR=/Volumes/No Such Drive st-test/SafeTorrents\n")
+        res = self.release("scanned", "CLEAN")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("the drive No Such Drive st-test isn't connected", res.stderr)
+        self.assertIn("stays in quarantine", res.stderr)
+        self.assertFalse(any("mark-released" in c for c in self.calls()))
+
     def assert_special_refused(self):
         res = self.release("scanned", "CLEAN")
         self.assertNotEqual(res.returncode, 0)
