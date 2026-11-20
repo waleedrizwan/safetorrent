@@ -70,6 +70,7 @@ DEFAULTS = {
     "METADATA_TIMEOUT_SECONDS": "300",
     "MAX_EXTRACT_GB": "50",
     "HASHLOOKUP": "yes",
+    "DISARM_MEDIA": "yes",
 }
 
 # ---------------------------------------------------------------- file kinds
@@ -980,6 +981,9 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
         print(paint(f"\nDownloading into the VM's quarantine ({human(meta['total'])})…", "1"), flush=True)
     meta.update(status="downloading", phase="Connecting to peers")
     meta.pop("error", None)
+    # Resuming re-checks the pieces and fetches the originals of anything rebuilt, so rebuild again.
+    meta.pop("disarmed", None)
+    meta.pop("disarm_findings", None)
     claim(meta)
     save_meta(d, meta)
     log = d / "aria2.log"
@@ -1602,6 +1606,197 @@ def trust_checksum(findings: list[dict]) -> None:
 
 
 
+# ---------------------------------------------------------------- disarming
+
+# Rebuilding a file keeps what you'd watch, hear or read and drops the places an exploit
+# hides: fonts and other attachments in a video, metadata in a picture, scripts, launch
+# actions and embedded files in a PDF, odd sections and control characters in subtitles.
+# Detection only catches what someone has already seen; this works on attacks nobody has.
+DISARM_VIDEO = {"mkv", "webm", "mp4", "m4v", "mov"}
+DISARM_IMAGES = {"jpg", "jpeg", "png"}
+DISARM_SUBS = {"srt", "vtt", "ass", "ssa"}
+DISARM_PDF = {"pdf"}
+DISARM_ALL = DISARM_VIDEO | DISARM_IMAGES | DISARM_SUBS | DISARM_PDF
+DISARM_CATEGORIES = ("media", "docs")
+SUB_MAX_LINE = 64 * 1024
+ASS_SECTIONS = {b"[script info]", b"[v4+ styles]", b"[v4 styles]", b"[events]"}  # no [fonts] or [graphics]
+SUB_CONTROL = bytes(c for c in range(32) if c not in (9, 10, 13)) + b"\x7f"
+PDF_BAD_ACTIONS = {"/JavaScript", "/Launch", "/SubmitForm", "/ImportData", "/GoToE", "/RichMediaExecute",
+                   "/Rendition", "/Sound", "/Movie"}
+
+
+def disarm_enabled(cfg: dict, meta: dict) -> bool:
+    # A file the publisher's checksum vouches for must stay byte-for-byte what they published.
+    return (cfg.get("DISARM_MEDIA", "yes").lower() in ("yes", "true", "1")
+            and meta.get("category") in DISARM_CATEGORIES and not meta.get("sha256"))
+
+
+def sanitize_subtitle(data: bytes, ext: str) -> bytes:
+    """Subtitles rebuilt line by line: no control characters, no absurdly long lines, and
+    for ASS/SSA only the script info, styles and events (embedded fonts and pictures go).
+    Works on bytes so any 8-bit or UTF-8 text keeps its encoding; UTF-16 is converted and back."""
+    utf16 = data.startswith((b"\xff\xfe", b"\xfe\xff"))
+    if utf16:
+        data = data.decode("utf-16", "replace").encode("utf-8")
+    out, section = [], None
+    for line in data.split(b"\n"):
+        line = line.rstrip(b"\r").translate(None, SUB_CONTROL)[:SUB_MAX_LINE]
+        if ext in ("ass", "ssa"):
+            head = line.strip().lower()
+            if head.startswith(b"[") and head.endswith(b"]"):
+                section = head
+            if section is not None and section not in ASS_SECTIONS:
+                continue
+        out.append(line)
+    result = b"\n".join(out)
+    return result.decode("utf-8", "replace").encode("utf-16") if utf16 else result
+
+
+def ffmpeg_cmd(ext: str, src: Path, dest: Path) -> list[str]:
+    base = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+    if ext in DISARM_VIDEO:
+        # Copy the picture, sound and subtitle streams as they are; leave out attachments
+        # (fonts, which a player's font engine would parse) and data streams.
+        return base + ["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy", "-map_metadata", "0",
+                       "-max_muxing_queue_size", "9999", "-y", str(dest)]
+    quality = ["-q:v", "2"] if ext in ("jpg", "jpeg") else []
+    return base + ["-map_metadata", "-1", "-frames:v", "1", "-update", "1", *quality, "-y", str(dest)]
+
+
+def cmd_disarm_pdf(args, _cfg) -> int:
+    """Runs as the torrent user, offline (see disarm): the PDF without scripts, automatic
+    actions, launch/submit actions, embedded files or XFA forms."""
+    import pikepdf  # only installed in the VM
+    removed = 0
+    containers = (pikepdf.Array, pikepdf.Dictionary, pikepdf.Stream)
+
+    def direct_container(v) -> bool:  # numbers come back as Python ints; shared objects get their own pass
+        return isinstance(v, containers) and not v.is_indirect
+
+    def scrub(o, depth: int = 0) -> None:
+        nonlocal removed
+        if depth > 64:
+            return
+        if isinstance(o, pikepdf.Array):
+            for item in o:
+                if direct_container(item):
+                    scrub(item, depth + 1)
+            return
+        if not isinstance(o, (pikepdf.Dictionary, pikepdf.Stream)):
+            return
+        if str(o.get("/S", "")) in PDF_BAD_ACTIONS:
+            for k in list(o.keys()):
+                del o[k]
+            removed += 1
+            return
+        for k in ("/AA", "/JS", "/OpenAction", "/XFA", "/EmbeddedFiles", "/JavaScript", "/RichMediaContent"):
+            if k in o:
+                del o[k]
+                removed += 1
+        if isinstance(o, pikepdf.Stream) and str(o.get("/Type", "")) == "/EmbeddedFile":
+            o.write(b"")
+            removed += 1
+        for k in list(o.keys()):
+            v = o[k]
+            if direct_container(v):
+                scrub(v, depth + 1)
+
+    with pikepdf.open(args.src) as pdf:
+        for obj in pdf.objects:
+            scrub(obj)
+        scrub(pdf.trailer)
+        pdf.save(args.dest)
+    print(json.dumps({"removed": removed}))
+    return 0
+
+
+def take_output(work_file: Path, target: Path) -> bool:
+    """Put what an unprivileged step wrote in place of `target`. Copied through one checked
+    descriptor into a file root creates, so nothing can be swapped in along the way."""
+    tmp = None
+    try:
+        with open_nofollow(work_file) as src:
+            info = os.fstat(src.fileno())
+            if info.st_nlink != 1 or info.st_size == 0:
+                return False
+            fd, tmp = tempfile.mkstemp(prefix=".disarm-", dir=target.parent)
+            with os.fdopen(fd, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def replace_bytes(target: Path, data: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".disarm-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def disarm(d: Path, on_progress=lambda _msg: None) -> list[dict]:
+    """Rebuild the download's videos, pictures, subtitles and PDFs in place (files/ is
+    root's by now). ffmpeg and pikepdf parse hostile files, so they run as the torrent
+    user with no network, writing only to a scratch folder."""
+    targets = [(rel, size) for rel, size in walk_files(d / "files") if ext_of(rel) in DISARM_ALL and size > 0]
+    if not targets:
+        return []
+    out: list[dict] = []
+    rebuilt = 0
+    work = d / "disarm"
+    shutil.rmtree(work, ignore_errors=True)
+    # Safe as root: d is root-owned and disarm/ was just removed, so nothing can be planted here.
+    run(["install", "-d", "-m", "700", "-o", TORRENT_USER, "-g", TORRENT_USER, str(work)])
+    try:
+        for n, (rel, size) in enumerate(targets, 1):
+            on_progress(f"Rebuilding media files ({n} of {len(targets)})")
+            src, ext = d / "files" / rel, ext_of(rel)
+            try:
+                if ext in DISARM_SUBS:
+                    with open_nofollow(src) as fh:
+                        replace_bytes(src, sanitize_subtitle(fh.read(), ext))
+                    rebuilt += 1
+                    continue
+                check = EXPECTED_MAGIC.get(ext)
+                if check and not check(read_head(src)):
+                    continue  # not really that kind of file: sniff() reports it
+            except OSError as e:
+                out.append(finding(WARN, rel, f"couldn't be rebuilt ({e.strerror}); this is the original"))
+                continue
+            if shutil.disk_usage(QUARANTINE).free < size * 1.05 + DISK_RESERVE:
+                out.append(finding(WARN, rel, "not enough space in the VM to rebuild it; this is the original"))
+                continue
+            dest = work / f"{n}.{ext}"
+            cmd = (["/usr/bin/python3", "-I", str(AGENT), "disarm-pdf", str(src), str(dest)] if ext in DISARM_PDF
+                   else ffmpeg_cmd(ext, src, dest))
+            res = run_step(cmd, step_unit("disarm", d.name), "RuntimeMaxSec=10800", *offline_sandbox("1G", work),
+                           capture_output=True, text=True, errors="replace")
+            if res.returncode == 0 and take_output(dest, src):
+                rebuilt += 1
+            else:
+                why = (res.stderr.strip().splitlines() or [f"exit code {res.returncode}"])[-1][:200]
+                out.append(finding(WARN, rel, f"couldn't be rebuilt to strip anything hidden in it ({why}); "
+                                              "this is the original"))
+            dest.unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if rebuilt:
+        out.append(finding(INFO, "", f"rebuilt {rebuilt} video/picture/subtitle/PDF file(s) to strip anything hidden "
+                                     "in them, so they're no longer byte-identical to the torrent's (DISARM_MEDIA=no "
+                                     "keeps the originals)"))
+    return out
+
+
 def write_manifest(d: Path) -> str:
     """Size and SHA-256 of every file that was scanned, so the Mac can check that what
     it received is exactly that. Root's, in root's folder. Returns its own SHA-256."""
@@ -1628,10 +1823,15 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
     shutil.rmtree(d / "extracted", ignore_errors=True)
     # Safe as root: d is root-owned and extracted/ was just removed, so nothing can be planted here.
     run(["install", "-d", "-o", TORRENT_USER, "-g", TORRENT_USER, str(d / "extracted")])
+    # Once per download: a rescan checks the rebuilt files and keeps what the rebuild reported.
+    if disarm_enabled(cfg, meta) and not meta.get("disarmed"):
+        set_phase(d, meta, "Rebuilding media files")
+        meta.update(disarm_findings=disarm(d, lambda msg: set_phase(d, meta, msg)), disarmed=True)
+        save_meta(d, meta)
     files = walk_files(d / "files")
     category = meta["category"]
     set_phase(d, meta, "Checking what each file really is")
-    findings = check_names(files, category, meta["name"])
+    findings = check_names(files, category, meta["name"]) + list(meta.get("disarm_findings", []))
     findings += [finding(DANGER, rel, "symlink or special file: not scanned, and won't be copied to your Mac")
                  for rel in special_entries(d / "files")]
     for rel, _ in files:
@@ -2222,11 +2422,11 @@ def secure_layout() -> None:
             run(["chown", "-R", "--no-dereference", "root:root", str(d / "files")])
 
 
-UNPRIVILEGED = {"yara-scan": cmd_yara_scan}
+UNPRIVILEGED = {"yara-scan": cmd_yara_scan, "disarm-pdf": cmd_disarm_pdf}
 
 
 def agent_readable() -> None:
-    """The torrent user runs this file for the YARA scan (it holds no secrets).
+    """The torrent user runs this file for YARA and PDF clean-up (it holds no secrets).
     VMs set up before that made its folder root-only."""
     folder = Path("/opt/safetorrent")
     if AGENT.parent == folder and folder.stat().st_mode & 0o777 != 0o755:
@@ -2265,6 +2465,9 @@ def main() -> int:
     mr.add_argument("dest")
     for name in ("list", "items", "last", "vpn", "update", "health", "doctor"):
         sub.add_parser(name)
+    dp = sub.add_parser("disarm-pdf")
+    dp.add_argument("src")
+    dp.add_argument("dest")
     ys = sub.add_parser("yara-scan")
     ys.add_argument("rules")
     ys.add_argument("roots", nargs="+")

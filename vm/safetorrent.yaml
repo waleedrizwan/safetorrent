@@ -45,7 +45,7 @@ provision:
     id torrent >/dev/null 2>&1 || useradd --system --home-dir /var/lib/safetorrent/torrent \
       --no-create-home --shell /usr/sbin/nologin torrent
     install -d -m 700 -o torrent -g torrent /var/lib/safetorrent/torrent
-    # The agent's folder is readable: its unprivileged steps (the YARA scan) run its code.
+    # The agent's folder is readable: its unprivileged steps (YARA, PDF clean-up) run its code.
     install -d -m 700 /etc/safetorrent
     install -d -m 755 /opt/safetorrent
     systemctl enable --now clamav-freshclam

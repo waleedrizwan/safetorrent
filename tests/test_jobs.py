@@ -210,6 +210,21 @@ class ReleaseState(Base):
             st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
         return st.load_meta(d)["status"]
 
+    def test_media_is_rebuilt_once_and_its_report_kept_on_rescan(self):
+        d = self.make(status="downloaded", category="media")
+        note = st.finding(st.WARN, "Show/ep1.mkv", "couldn't be rebuilt")
+        for _ in range(2):  # the scan, then a rescan
+            disarm = mock.Mock(return_value=[note])
+            with mock.patch.multiple(st, run=mock.DEFAULT, ensure_firewall=mock.DEFAULT,
+                                     walk_files=mock.Mock(return_value=[]), extract_archives=mock.Mock(return_value=[]),
+                                     clamav_scan=mock.Mock(return_value=[]), virustotal=mock.Mock(return_value=[]),
+                                     disarm=disarm):
+                st.scan(d, st.load_meta(d), {"USE_VPN": "no"}, quiet=True)
+            meta = st.load_meta(d)
+            self.assertIn(note, meta["scan"]["findings"])
+        disarm.assert_not_called()  # the second time
+        self.assertTrue(meta["disarmed"])
+
     def test_extracted_is_locked_before_clamav(self):
         """7z runs as the torrent user, so what it unpacked must be taken away from it before ClamAV reads it."""
         d = self.make(status="downloaded", category="media")
