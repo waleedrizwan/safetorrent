@@ -71,6 +71,26 @@ class Category(unittest.TestCase):
         self.assertEqual(st.detect_category([("b.pdf", 5 * MB), ("c.epub", MB)]), "docs")
         self.assertEqual(st.detect_category([("debian.iso", 600 * MB)]), "iso")
 
+    def test_padding_doesnt_turn_a_film_into_software(self):
+        padded = [("F/film.mkv", 600 * MB), ("F/extras.bin", 400 * MB), ("F/Codec_Installer.exe", 2 * MB)]
+        self.assertEqual(st.detect_category(padded), "media")
+        # Padding bigger than the film: the release-style name still gives it away.
+        padded = [("F/film.mkv", 600 * MB), ("F/extras.bin", 900 * MB), ("F/Codec_Installer.exe", 2 * MB)]
+        self.assertEqual(st.detect_category(padded, "Film.2024.1080p.WEB-DL"), "media")
+        self.assertEqual(st.detect_category(padded, "Show S01E02"), "media")
+        self.assertEqual(st.detect_category(padded, "Film"), "software")
+
+    def test_software_with_a_small_video_stays_software(self):
+        files = [("App/setup.exe", 300 * MB), ("App/tutorial 1080p.mp4", 200 * MB)]
+        self.assertEqual(st.detect_category(files, "App Suite 2024"), "software")
+
+    def test_programs_next_to_a_full_length_video_get_a_warning(self):
+        files = [("F/film.mkv", 600 * MB), ("F/extras.bin", 900 * MB), ("F/Codec_Installer.exe", 2 * MB)]
+        found = st.check_names(files, "software", "Film")
+        self.assertIn("codec", " ".join(f["msg"] for f in found if f["level"] == st.WARN))
+        self.assertEqual(st.max_level(st.check_names([("App/setup.exe", 50 * MB), ("App/intro.mp4", 20 * MB)],
+                                                     "software")), st.INFO)
+
 
 class NameRules(unittest.TestCase):
     def test_exe_in_movie_rejected(self):
