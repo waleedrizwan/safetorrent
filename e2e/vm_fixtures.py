@@ -62,6 +62,34 @@ def zip_bytes(entries: dict) -> bytes:
     return buf.getvalue()
 
 
+def real_media(scratch: Path) -> dict:
+    """Real files with the extras an exploit would hide in: a font attached to a video, a
+    PDF that runs a script when opened and carries a file, fonts embedded in subtitles."""
+    font = scratch / "font.ttf"
+    font.write_bytes(b"not really a font")
+    video = scratch / "episode.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=2:s=320x240",
+                    "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-c:a", "aac", "-attach", str(font),
+                    "-metadata:s:t", "mimetype=application/x-truetype-font", "-fflags", "+bitexact",
+                    "-y", str(video)], check=True)
+    import pikepdf
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+    pdf.Root.OpenAction = pikepdf.Dictionary(S=pikepdf.Name.JavaScript, JS=pikepdf.String("app.alert('e2e')"))
+    hidden = pdf.make_stream(b"a file hidden inside the PDF")
+    hidden.Type = pikepdf.Name.EmbeddedFile
+    pdf.Root.Names = pikepdf.Dictionary(EmbeddedFiles=pikepdf.Dictionary(Names=[
+        "hidden.txt", pikepdf.Dictionary(Type=pikepdf.Name.Filespec, F="hidden.txt", EF=pikepdf.Dictionary(F=hidden))]))
+    pdf.save(scratch / "notes.pdf", deterministic_id=True)
+    return {
+        "episode.mkv": video.read_bytes(),
+        "notes.pdf": (scratch / "notes.pdf").read_bytes(),
+        "episode.ass": b"[Script Info]\nTitle: e2e\n\n[V4+ Styles]\nStyle: Default,Arial\n\n[Fonts]\n"
+                       b"fontname: hidden.ttf\nM8BADBYTES\n\n[Events]\n"
+                       b"Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Hello\n",
+    }
+
+
 def sevenz(dest: Path, src: Path, *switches: str) -> None:
     subprocess.run(["7z", "a", "-bd", "-y", *switches, str(dest), str(src)], check=True, stdout=subprocess.DEVNULL)
 
@@ -103,6 +131,7 @@ def fixtures(scratch: Path) -> dict:
     sevenz(bomb, zeros, "-t7z", "-mx=9")
     zeros.unlink()
     out["ST-E2E Zip Bomb"] = {"bomb.7z": bomb.read_bytes(), "readme.txt": b"Unpacks to 1.5 GB.\n"}
+    out["ST-E2E Real Media"] = real_media(scratch)
     return out
 
 
