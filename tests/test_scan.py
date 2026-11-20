@@ -1,10 +1,15 @@
 """Scan tests for the VM agent: archive extraction and ClamAV. 7z is replaced by
 a fake that "unpacks" archives from a table and clamscan by canned results, so
 these run anywhere."""
+import argparse
+import contextlib
 import fcntl
+import io
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -484,6 +489,79 @@ class TrustChecksum(unittest.TestCase):
         findings = [st.finding(st.WARN, "os.iso", "too large", unscanned=True)]
         st.trust_checksum(findings)
         self.assertEqual(findings[0]["level"], st.WARN)
+
+
+class Yara(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        rules = self.d / "rules.yarc"
+        rules.write_bytes(b"compiled")
+        mock.patch.object(st, "YARA_RULES", rules).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def scan(self, stdout, rc=0, stderr=""):
+        (self.d / "files").mkdir(exist_ok=True)
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+        with mock.patch.object(st, "run", side_effect=run):
+            out = st.yara_scan(self.d)
+        return out, calls
+
+    def test_match_is_danger_with_the_rule_name(self):
+        line = json.dumps({"path": str(self.d / "extracted" / "a.zip.d" / "x.exe"),
+                           "rules": [{"rule": "MAL_Stealer", "description": "an info stealer"}]})
+        out, calls = self.scan(line + "\n")
+        self.assertEqual([(f["level"], f["path"]) for f in out], [(st.DANGER, "a.zip.d/x.exe")])
+        self.assertIn("MAL_Stealer (an info stealer)", out[0]["msg"])
+        # Run as the torrent user, offline, in its own throwaway unit.
+        self.assertIn("User=torrent", calls[0])
+        self.assertIn("IPAddressDeny=any", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--") + 1:][3], "yara-scan")
+
+    def test_many_rules_are_summarised(self):
+        line = json.dumps({"path": str(self.d / "files" / "x"), "rules": [{"rule": f"R{i}"} for i in range(5)]})
+        out, _ = self.scan(line)
+        self.assertIn("and 2 more", out[0]["msg"])
+
+    def test_a_crash_is_a_warning_not_silence(self):
+        out, _ = self.scan("", rc=1, stderr="Traceback...\nyara.Error: could not load rules")
+        self.assertEqual(st.max_level(out), st.WARN)
+        self.assertIn("could not load rules", out[0]["msg"])
+
+    def test_garbage_lines_from_the_scanner_are_ignored(self):
+        out, _ = self.scan("not json\n{\"path\": 5}\n")
+        self.assertEqual(out, [])
+
+    def test_no_rules_yet(self):
+        st.YARA_RULES.unlink()
+        out, calls = self.scan("")
+        self.assertEqual((st.max_level(out), calls), (st.INFO, []))
+
+    def test_scanner_skips_media_and_reports_matches(self):
+        """cmd_yara_scan with a stand-in for the yara module (only installed in the VM)."""
+        root = self.d / "files"
+        for rel, data in {"Show/ep1.mkv": b"video", "Show/x.exe": b"MZbad", "Show/ok.txt": b"fine"}.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_bytes(data)
+        seen = []
+
+        class Rules:
+            def match(self, filepath, timeout):
+                seen.append(Path(filepath).name)
+                hit = type("M", (), {"rule": "Bad", "meta": {"description": "bad"}})
+                return [hit] if filepath.endswith(".exe") else []
+        fake = type(sys)("yara")
+        fake.load = lambda _path: Rules()
+        fake.Error = Exception
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"yara": fake}), contextlib.redirect_stdout(out):
+            st.cmd_yara_scan(argparse.Namespace(rules="r", roots=[str(root)]), {})
+        self.assertEqual(sorted(seen), ["ok.txt", "x.exe"])
+        self.assertEqual([json.loads(x)["path"] for x in out.getvalue().splitlines()], [str(root / "Show" / "x.exe")])
 
 
 if __name__ == "__main__":

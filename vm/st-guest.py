@@ -20,6 +20,7 @@ import collections
 import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import pwd
@@ -36,6 +37,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
@@ -862,6 +864,7 @@ def check_health(cfg: dict) -> dict:
 
     add("virusdb", *virusdb_check())
     add("tools", *tools_check())
+    add("yara", *yara_check())
 
     key = cfg["VT_API_KEY"]
     if not key:
@@ -1263,6 +1266,113 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
     return out
 
 
+# ---------------------------------------------------------------- YARA
+
+# YARA Forge's "core" set: ~5,000 curated, tested rules from public rule repositories,
+# rebuilt weekly. Rules only describe what to look for; the worst a bad set can do is
+# flag the wrong files.
+YARA_URL = "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip"
+YARA_DIR = STATE_DIR / "yara"
+YARA_RULES = YARA_DIR / "rules.yarc"
+YARA_MAX_AGE_DAYS = 30
+YARA_MAX_BYTES = 256 * 1024**2  # bigger files are media or disk images; ClamAV covers those
+YARA_DOWNLOAD_LIMIT = 100 * 1024**2
+AGENT = Path(__file__).resolve()
+
+
+def update_yara_rules() -> str | None:
+    """Download and compile the latest rules. Returns what went wrong, or None."""
+    try:
+        with urllib.request.urlopen(YARA_URL, timeout=120) as r:
+            data = r.read(YARA_DOWNLOAD_LIMIT + 1)
+        if len(data) > YARA_DOWNLOAD_LIMIT:
+            return "the YARA rules download was unexpectedly large"
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            member = next(i for i in z.infolist() if i.filename.endswith(".yar") and i.file_size < YARA_DOWNLOAD_LIMIT)
+            source = z.read(member)
+    except (OSError, ValueError, StopIteration, zipfile.BadZipFile) as e:
+        return f"couldn't download the YARA rules ({e})"
+    # Compiled by the unprivileged user, offline: libyara parses the rule text.
+    work = Path(tempfile.mkdtemp(prefix="yara-", dir=STATE_DIR))
+    try:
+        (work / "rules.yar").write_bytes(source)
+        os.chmod(work / "rules.yar", 0o644)
+        shutil.chown(work, TORRENT_USER, TORRENT_USER)
+        res = run_step(["/usr/bin/python3", "-I", "-c", "import sys, yara; yara.compile(filepath=sys.argv[1]).save(sys.argv[2])",
+                        str(work / "rules.yar"), str(work / "rules.yarc")], step_unit("yarac"),
+                       *offline_sandbox("2G", work), capture_output=True, text=True, errors="replace")
+        if res.returncode != 0:
+            return "the YARA rules didn't compile: " + (res.stderr.strip().splitlines() or ["no details"])[-1]
+        with open_nofollow(work / "rules.yarc") as fh:
+            compiled = fh.read()
+        YARA_DIR.mkdir(mode=0o755, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=YARA_DIR)
+        with os.fdopen(fd, "wb") as out:
+            out.write(compiled)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, YARA_RULES)
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def yara_check() -> tuple:
+    if not YARA_RULES.exists():
+        return "warn", "YARA rules aren't downloaded yet", "Update downloads them", "update"
+    age = (time.time() - YARA_RULES.stat().st_mtime) / 86400
+    if age > YARA_MAX_AGE_DAYS:
+        return "warn", "YARA rules are out of date", f"Last updated {age:.0f} days ago", "update"
+    return "ok", "YARA rules are current", "Updated today" if age < 1 else f"Updated {age:.0f} day(s) ago"
+
+
+def cmd_yara_scan(args, _cfg) -> int:
+    """Runs as the torrent user, offline (see yara_scan): one JSON line per file a rule matched."""
+    import yara  # only installed in the VM
+    rules = yara.load(args.rules)
+    for root in map(Path, args.roots):
+        for rel, size in walk_files(root):
+            if size > YARA_MAX_BYTES or kind_of(ext_of(rel)) in MEDIA_KINDS:
+                continue
+            path = str(root / rel)
+            try:
+                matches = rules.match(filepath=path, timeout=60)
+            except yara.Error as e:
+                print(json.dumps({"path": path, "error": str(e)}), flush=True)
+                continue
+            if matches:
+                print(json.dumps({"path": path, "rules": [{"rule": m.rule, "description": str(m.meta.get("description", ""))}
+                                                          for m in matches]}), flush=True)
+    return 0
+
+
+def yara_scan(d: Path) -> list[dict]:
+    if not YARA_RULES.exists():
+        return [finding(INFO, "", "YARA check skipped: its rules aren't downloaded yet (`safetorrent update`)")]
+    roots = [str(p) for p in (d / "files", d / "extracted") if p.exists()]
+    res = run_step(["/usr/bin/python3", "-I", str(AGENT), "yara-scan", str(YARA_RULES), *roots],
+                   step_unit("yara", d.name), "RuntimeMaxSec=3600", *offline_sandbox("2G"),
+                   capture_output=True, text=True, errors="replace")
+    out: list[dict] = []
+    for line in res.stdout.splitlines():
+        try:
+            hit = json.loads(line)
+            rel = os.path.relpath(hit["path"], d).split("/", 1)[1]  # drop files/ or extracted/
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+            continue
+        if hit.get("error"):
+            out.append(finding(WARN, rel, f"YARA couldn't check it ({hit['error']})"))
+            continue
+        names = [r["rule"] + (f" ({r['description']})" if r.get("description") else "") for r in hit.get("rules", [])]
+        out.append(finding(DANGER, rel, "matches YARA malware rule " + "; ".join(names[:3])
+                           + (f" and {len(names) - 3} more" if len(names) > 3 else "")))
+    if res.returncode != 0:
+        out.append(finding(WARN, "", "the YARA check didn't finish: "
+                           + (res.stderr.strip().splitlines() or [f"exit code {res.returncode}"])[-1]))
+    return out
+
+
+# ---------------------------------------------------------------- VirusTotal
+
 VT_TOO_NEW_DAYS = 7     # antivirus engines usually need days to catch up with a new sample
 VT_TOO_OLD_DAYS = 365   # "0 detections" from a scan this old says little about today's signatures
 
@@ -1455,6 +1565,8 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
             print("Waiting for another virus scan to finish…", flush=True)
     locked = frozenset(f["path"] for f in findings if f.get("encrypted"))
     findings += clamav_scan(d, on_wait=wait_for_other_scan, flagged=locked)
+    set_phase(d, meta, "YARA rules")
+    findings += yara_scan(d)
     set_phase(d, meta, "VirusTotal lookups")
     findings += virustotal(d, cfg, category, (lambda msg: set_phase(d, meta, msg)) if quiet else None)
     if meta.get("sha256"):
@@ -1964,6 +2076,10 @@ def cmd_update(args, cfg) -> int:
     if res.returncode != 0:
         detail = (res.stderr.strip().splitlines() or ["see `journalctl -u safetorrent-apt`"])[-1]
         print(paint(f"Security updates didn't finish: {detail}", "33"))
+    print("Updating YARA rules…", flush=True)
+    problem = update_yara_rules()
+    if problem:
+        print(paint(problem, "33"))
     return cmd_health(args, cfg)
 
 
@@ -2015,6 +2131,9 @@ def secure_layout() -> None:
             run(["chown", "-R", "--no-dereference", "root:root", str(d / "files")])
 
 
+UNPRIVILEGED = {"yara-scan": cmd_yara_scan}
+
+
 def _terminate(_sig, _frame):
     raise KeyboardInterrupt
 
@@ -2047,7 +2166,12 @@ def main() -> int:
     mr.add_argument("dest")
     for name in ("list", "items", "last", "vpn", "update", "health", "doctor"):
         sub.add_parser(name)
+    ys = sub.add_parser("yara-scan")
+    ys.add_argument("rules")
+    ys.add_argument("roots", nargs="+")
     args = p.parse_args()
+    if args.cmd in UNPRIVILEGED:  # run by root as the torrent user, on hostile files: no root setup
+        return UNPRIVILEGED[args.cmd](args, {})
     handlers = {
         "get": cmd_get, "add": cmd_add, "start": cmd_start, "run": cmd_run, "stop": cmd_stop,
         "items": cmd_items, "item": cmd_item, "health": cmd_health, "doctor": cmd_health,
