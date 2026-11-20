@@ -329,6 +329,17 @@ class Release(unittest.TestCase):
             self.assertEqual(flag.returncode, 0, f"no quarantine flag on {p}")
             self.assertIn(";safetorrent;", flag.stdout)
 
+    def test_no_release_when_the_quarantine_flag_cant_be_set(self):
+        """Some drives drop extended attributes: an app copied there would open with no Gatekeeper check."""
+        fake = self.tmp / "bin" / "xattr"
+        fake.write_text("#!/bin/sh\nexit 1\n")
+        fake.chmod(0o755)
+        res = self.release("scanned", "CLEAN")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("quarantine flag", res.stderr)
+        self.assertFalse(any("mark-released" in c for c in self.calls()))
+        self.assertEqual(list(self.downloads.iterdir()), [])  # nothing in place, staging cleaned up
+
 
 if __name__ == "__main__":
     unittest.main()
