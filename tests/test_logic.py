@@ -280,6 +280,83 @@ class HashLookup(unittest.TestCase):
         self.assertEqual(sent, [st.hashlib.sha1(b"MZx").hexdigest().upper()])
 
 
+class Authenticode(unittest.TestCase):
+    def test_embedded_microsoft_root_is_the_real_one(self):
+        body = "".join(st.MICROSOFT_ROOT_2011.strip().splitlines()[1:-1])
+        der = st.base64.b64decode(body)
+        self.assertEqual(st.hashlib.sha256(der).hexdigest().upper(),
+                         "847DF6A78497943F27FC72EB93F9A637320A02B561D0A91B09E87A7807ED7C61")
+
+    def test_crl_armour_round_trips(self):
+        der = bytes(range(256)) * 3
+        pem = st.der_to_pem_crl(der).decode()
+        self.assertTrue(pem.startswith("-----BEGIN X509 CRL-----\n"))
+        self.assertTrue(all(len(line) <= 64 for line in pem.splitlines()))
+        self.assertEqual(st.base64.b64decode("".join(pem.splitlines()[1:-1])), der)
+
+    def outcome(self, first, second="", fetched=True):
+        """authenticode() with canned osslsigncode output and a stand-in for curl."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            calls = []
+
+            def run(cmd, **kw):
+                calls.append(cmd)
+                inner = cmd[cmd.index("--") + 1:]
+                if inner[0] == "curl":
+                    if fetched:
+                        Path(inner[inner.index("-o") + 1]).write_bytes(b"\x30\x82crl")
+                    return subprocess.CompletedProcess(cmd, 0 if fetched else 22, b"", b"")
+                verified = "-CRLfile" in inner
+                text = second if verified else first
+                return subprocess.CompletedProcess(cmd, 0 if verified and "Succeeded" in text else 1, text, "")
+            with mock.patch.object(st, "run", side_effect=run):
+                result = st.authenticode(work, work / "x.exe", work, work / "roots.pem")
+            return result, calls
+
+    SIGNED = ("Signer's certificate:\nIgnored CRL distribution point: http://crl.example.com/ca.crl\n"
+              "Signature verification: failed\nFailed\n")
+
+    def test_valid_signature_names_the_signer(self):
+        ok = "Signer #0:\n\t\tSubject: /C=GB/O=Simon Tatham/CN=Simon Tatham\nSignature verification: ok\nSucceeded\n"
+        (state, signer), calls = self.outcome(self.SIGNED, ok)
+        self.assertEqual((state, signer), ("valid", "Simon Tatham"))
+        curl = next(c for c in calls if "curl" in c)
+        self.assertIn("User=torrent", curl)
+        self.assertTrue(any(p.startswith("IPAddressDeny=10.0.0.0/8") for p in curl))  # internet, never the LAN or Mac
+        verify = [c for c in calls if "osslsigncode" in c]
+        self.assertTrue(all("IPAddressDeny=any" in c for c in verify))  # the parser itself is offline
+
+    def test_unsigned_tampered_and_revoked(self):
+        self.assertEqual(self.outcome("No signature found\nFailed\n")[0], ("unsigned", ""))
+        self.assertEqual(self.outcome("Calculated message digest : AB  MISMATCH!!!\nFailed\n")[0], ("tampered", ""))
+        self.assertEqual(self.outcome(self.SIGNED, "certificate revoked\nFailed\n")[0][0], "invalid")
+        self.assertEqual(self.outcome(self.SIGNED, fetched=False)[0][0], "invalid")
+
+    def test_vouching_only_touches_unvouched_windows_programs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for rel, data in {"T/good.exe": b"MZgood", "T/bad.exe": b"MZbad", "T/tool": b"\x7fELF"}.items():
+                (d / "files" / rel).parent.mkdir(parents=True, exist_ok=True)
+                (d / "files" / rel).write_bytes(data)
+            findings = [st.finding(st.WARN, p, "never seen", unvouched=True) for p in ("T/good.exe", "T/bad.exe", "T/tool")]
+            answers = {"good.exe": ("valid", "Simon Tatham"), "bad.exe": ("tampered", "")}
+            checked = []
+
+            def authenticode(_d, path, _work, _roots):
+                checked.append(path.name)
+                return answers[path.name]
+            with mock.patch.object(st, "authenticode", side_effect=authenticode), \
+                 mock.patch.object(st, "codesign_roots", return_value=d / "roots.pem"), \
+                 mock.patch.object(st.shutil, "which", return_value="/usr/bin/osslsigncode"), \
+                 mock.patch.object(st, "run"):
+                st.authenticode_vouch(d, findings)
+        self.assertEqual(sorted(checked), ["bad.exe", "good.exe"])  # not the Linux program
+        self.assertEqual([f["level"] for f in findings], [st.INFO, st.WARN, st.WARN])
+        self.assertIn("Simon Tatham", findings[0]["msg"])
+        self.assertIn("changed after it was signed", findings[1]["msg"])
+
+
 class Verdicts(unittest.TestCase):
     def test_worst_finding_wins(self):
         f = [st.finding(st.INFO, "", "a"), st.finding(st.WARN, "", "b"), st.finding(st.INFECTED, "", "c")]

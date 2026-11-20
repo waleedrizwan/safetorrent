@@ -16,6 +16,7 @@ Pipeline for one torrent:
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import contextlib
 import fcntl
@@ -941,8 +942,9 @@ def obtain_torrent(src: Path, cfg: dict) -> bytes:
 
 
 # Scanning tools beyond the VM's first install: ffmpeg rebuilds media, pikepdf strips
-# scripts from PDFs, yara matches YARA rules. `safetorrent update` installs them.
-SCAN_PACKAGES = {"ffmpeg": "ffmpeg", "python3-pikepdf": "pikepdf", "python3-yara": "yara"}
+# scripts from PDFs, yara matches YARA rules, osslsigncode checks Windows signatures.
+# `safetorrent update` installs them.
+SCAN_PACKAGES = {"ffmpeg": "ffmpeg", "python3-pikepdf": "pikepdf", "python3-yara": "yara", "osslsigncode": "osslsigncode"}
 
 
 def python_module_ok(name: str) -> bool:
@@ -1585,6 +1587,152 @@ def hashlookup_vouch(d: Path, findings: list[dict], cfg: dict) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- Windows signatures
+
+# Windows trusts code signed under its own roots; Ubuntu's bundle has the public CAs that
+# sign most software (Sectigo, DigiCert...) but not Microsoft's, which signs Windows' own
+# programs. Microsoft Root Certificate Authority 2011, SHA-256 fingerprint
+# 847DF6A78497943F27FC72EB93F9A637320A02B561D0A91B09E87A7807ED7C61 (checked in the tests).
+MICROSOFT_ROOT_2011 = """\
+-----BEGIN CERTIFICATE-----
+MIIF7TCCA9WgAwIBAgIQP4vItfyfspZDtWnWbELhRDANBgkqhkiG9w0BAQsFADCB
+iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1Jl
+ZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBDb3Jwb3JhdGlvbjEyMDAGA1UEAxMp
+TWljcm9zb2Z0IFJvb3QgQ2VydGlmaWNhdGUgQXV0aG9yaXR5IDIwMTEwHhcNMTEw
+MzIyMjIwNTI4WhcNMzYwMzIyMjIxMzA0WjCBiDELMAkGA1UEBhMCVVMxEzARBgNV
+BAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jv
+c29mdCBDb3Jwb3JhdGlvbjEyMDAGA1UEAxMpTWljcm9zb2Z0IFJvb3QgQ2VydGlm
+aWNhdGUgQXV0aG9yaXR5IDIwMTEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK
+AoICAQCygEGqNThNE3IyaCJNuLLx/9VSvGzH9dJKjDbu0cJcfoyKrq8TKG/Ac+M6
+ztAlqFo6be+ouFmrEyNozQwph9FvgFyPRH9dkAFSWKxRxV8qh9zc2AodwQO5e7BW
+6KPeZGHCnvjzfLnsDbVU/ky2ZU+I8JxImQxCCwl8MVkXeQZ4KI2JOkwDJb5xalwL
+54RgpJki49KvhKSn+9GY7Qyp3pSJ4Q6g3MDOmT3qCFK7VnnkH4S6Hri0xElcTzFL
+h93dBWcmmYDgcRGjuKVB4qRTufcyKYMME782XgSzS0NHL2vikR7TmE/dQgfI6B0S
+/Jmpaz6SfsjWaTr8ZL22CZ3K/QwLopt3YEsDlKQwaRLWQi3BQUzK3Kr9j1uDRprZ
+/LHR47PJf0h6zSTwQY9cdNCssBAgBkm3xy0hyFfj0IbzA2j70M5xwYmZSmQBbP3s
+MJHPQTySx+W6hh1hhMdfgzlirrSSL0fzC/hV66AfWdC7dJse0Hbm8ukG1xDo+mTe
+acY1logC8Ea4PyeZb8txiSk190gWAjWP1Xl8TQLPX+uKg09FcYj5qQ1OcunCnAfP
+SRtOBA5jUYxe2ADBVSy2xuDCZU7JNDn1nLPEfuhhbhNfFcRf2X7tHc7uROzLLoax
+7Dj2cO2rXBPB2Q8Nx4CyVe0096yb5MPa50c8prWPMd/FS6/r8QIDAQABo1EwTzAL
+BgNVHQ8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUci06AjGQQ7kU
+BU7h6qfHMdEjiTQwEAYJKwYBBAGCNxUBBAMCAQAwDQYJKoZIhvcNAQELBQADggIB
+AH9yzw+3xRXbm8BJyiZb/p4T5tPw0tuXX/JLP02zrhmu7deXoKzvqTqjwkGw5biR
+nhOBJAPmCf0/V0A5ISRW0RAvS0CpNoZLtFNXmvvxfomPEf4YbFGq6O0JlbXlccmh
+6Yd1phV/yX43VF50k8XDZ8wNT2uoFwxtCJJ+i92Bqi1wIcM9BhS7vyRep4TXPw8h
+Ir1LAAbblxzYXtTFC1yHblCk6MM4pPvLLMWSZpuFXst6bJN8gClYW1e1QGm6CHmm
+ZGIVnYeWRbVmIyADixxzoNOieTPgUFmG2y/lAiXqcyqfABTINseSO+lOAOzYVgm5
+M0kS0lQLAausR7aRKX1MtHWAUgHoyoL2n8ysnI8X6i8msKtyrAv+nlEex0NVZ09R
+s1fWtuzuUrc66U7h14GIvE+OdbtLqPA1qibUZ2dJsnBMO5PcHd94kIZysjik0dyS
+TclY6ysSXNQ7roxrsIPlAT/4CTL2kzU0Iq/dNw13CYArzUgA8YyZGUcFAenRv9FO
+0OYoQzeZpApKCNmacXPSqs0xE2N2oTdvkjgefRI8ZjLny23h/FKJ3crWZgWalmG+
+oijHHKOnNlA8OqTfSm7mhzvO6/DggTedEzxSjr25HTTGHdUKaj2YKXCMiSrRq4IQ
+SB/c9O+lxbtVGjhjhE63bK2VVOxlIhBJF7jAHscPrFRH
+-----END CERTIFICATE-----
+"""
+SYSTEM_CAS = Path("/etc/ssl/certs/ca-certificates.crt")
+CODESIGN_ROOTS = STATE_DIR / "codesign-roots.pem"
+MAX_SIGNATURE_CHECKS = 50
+MAX_CRLS = 4
+CDP_RE = re.compile(r"CRL distribution point: (https?://\S+)")
+
+
+def codesign_roots() -> Path:
+    """The CAs a Windows signature may chain to, in a file the torrent user can read."""
+    roots = SYSTEM_CAS.read_bytes() + b"\n" + MICROSOFT_ROOT_2011.encode()
+    if not CODESIGN_ROOTS.exists() or CODESIGN_ROOTS.read_bytes() != roots:
+        fd, tmp = tempfile.mkstemp(dir=STATE_DIR)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(roots)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, CODESIGN_ROOTS)
+    return CODESIGN_ROOTS
+
+
+def der_to_pem_crl(der: bytes) -> bytes:
+    """No parsing, just the armour: osslsigncode (sandboxed) reads it."""
+    b64 = base64.encodebytes(der).replace(b"\n", b"")
+    lines = b"\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return b"-----BEGIN X509 CRL-----\n" + lines + b"\n-----END X509 CRL-----\n"
+
+
+def authenticode(d: Path, path: Path, work: Path, roots: Path) -> tuple[str, str]:
+    """("valid", signer) | ("tampered", "") | ("unsigned", "") | ("invalid", why).
+
+    osslsigncode parses the hostile file, so it runs as the torrent user, offline. A
+    signature only counts when its certificates haven't been revoked (a stolen signing
+    certificate gets revoked), so the revocation lists it names are fetched first, as
+    the torrent user, which can reach the internet but never the Mac or the LAN."""
+    def verify(*extra: str) -> subprocess.CompletedProcess:
+        return run_step(["osslsigncode", "verify", "-ignore-cdp", "-CAfile", str(roots), "-TSA-CAfile", str(roots),
+                         *extra, "-in", str(path)], step_unit("authenticode", d.name), "RuntimeMaxSec=300",
+                        *offline_sandbox("512M"), capture_output=True, text=True, errors="replace")
+    first = verify()
+    text = first.stdout + first.stderr
+    if "No signature found" in text:
+        return "unsigned", ""
+    if "MISMATCH" in text:
+        return "tampered", ""
+    crls = b""
+    for n, url in enumerate(sorted(set(CDP_RE.findall(text)))[:MAX_CRLS]):
+        dest = work / f"crl-{n}.der"
+        got = run_step(["curl", "-fsSL", "--proto", "=http,https", "--max-filesize", "5000000", "-m", "30",
+                        "-o", str(dest), url], step_unit("crl", d.name), "RuntimeMaxSec=60", *aria2_sandbox(work),
+                       capture_output=True)
+        if got.returncode == 0:
+            try:
+                with open_nofollow(dest) as fh:
+                    crls += der_to_pem_crl(fh.read(5_000_001))
+            except OSError:
+                pass
+    if not crls:
+        return "invalid", "its certificate's revocation list couldn't be fetched"
+    crl_file = work / "crls.pem"
+    crl_file.write_bytes(crls)
+    os.chmod(crl_file, 0o644)
+    second = verify("-CRLfile", str(crl_file), "-TSA-CRLfile", str(crl_file))
+    out = second.stdout + second.stderr
+    if second.returncode == 0 and "Succeeded" in out:
+        signer = re.search(r"Signer #0:\s*\n\s*Subject: .*?CN=([^/\n]+)", out)
+        return "valid", signer.group(1).strip() if signer else "an identified publisher"
+    why = "revoked" if "revoked" in out.lower() else "its certificate chain doesn't lead to a trusted root"
+    return "invalid", why
+
+
+def authenticode_vouch(d: Path, findings: list[dict]) -> list[dict]:
+    """For Windows programs nothing else vouched for: a valid, unrevoked signature from a
+    CA Windows trusts vouches for one; a signature that no longer matches the file (the
+    file was changed after signing, as cracks do) is called out."""
+    waiting = []
+    for f in findings:
+        if f.get("unvouched") and f["level"] == WARN and f["path"]:
+            path = next((p for p in (d / "files" / f["path"], d / "extracted" / f["path"]) if p.is_file()), None)
+            if path and read_head(path, 2) == b"MZ":
+                waiting.append((f, path))
+    if not waiting or not shutil.which("osslsigncode"):
+        return []
+    roots = codesign_roots()
+    work = d / "authenticode"
+    out: list[dict] = []
+    for f, path in waiting[:MAX_SIGNATURE_CHECKS]:
+        shutil.rmtree(work, ignore_errors=True)
+        # Safe as root: d is root-owned and authenticode/ was just removed.
+        run(["install", "-d", "-m", "700", "-o", TORRENT_USER, "-g", TORRENT_USER, str(work)])
+        try:
+            state, detail = authenticode(d, path, work, roots)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        if state == "valid":
+            f.update(level=INFO, msg=f["msg"] + f"; but it carries a valid, unrevoked Windows signature from {detail}")
+        elif state == "tampered":
+            f["msg"] += "; and its Windows signature no longer matches it: it was changed after it was signed"
+        elif state == "invalid":
+            f["msg"] += f"; it's signed, but the signature doesn't hold up ({detail})"
+    if len(waiting) > MAX_SIGNATURE_CHECKS:
+        out.append(finding(INFO, "", f"only the first {MAX_SIGNATURE_CHECKS} of {len(waiting)} Windows programs had "
+                                     "their signatures checked"))
+    return out
+
+
 def verify_checksum(d: Path, expected: str) -> list[dict]:
     expected = expected.lower().strip()
     files = sorted(walk_files(d / "files"), key=lambda f: -f[1])
@@ -1861,7 +2009,9 @@ def scan(d: Path, meta: dict, cfg: dict, quiet: bool = False) -> int:
         set_phase(d, meta, "Checking the publisher's checksum")
         findings += verify_checksum(d, meta["sha256"])
         trust_checksum(findings)
-    # After the checksum, so only programs nothing else vouched for are looked up.
+    # After the checksum, so only programs nothing else vouched for are checked or looked up.
+    set_phase(d, meta, "Checking Windows signatures")
+    findings += authenticode_vouch(d, findings)
     set_phase(d, meta, "Known-software lookup (CIRCL hashlookup)")
     findings += hashlookup_vouch(d, findings, cfg)
     set_phase(d, meta, "Recording what was scanned")
