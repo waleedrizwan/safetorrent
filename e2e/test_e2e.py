@@ -196,6 +196,28 @@ class Isolation(unittest.TestCase):
         self.assertNotEqual(as_torrent(f"curl -s -o /dev/null -m 5 http://{gateway}/").returncode, 0)
         self.assertEqual(as_torrent(f"curl -s -o /dev/null -m 5 http://127.0.0.1:{PORT}/").returncode, 0)
 
+    def test_unpacker_cannot_touch_other_downloads_or_the_network(self):
+        """A 7z exploited by one archive, inside the agent's own sandbox for 7z."""
+        base = "/srv/quarantine/st-e2e-sandbox"
+        self.addCleanup(lambda: vm(f"rm -rf {base}", check=False))
+        probe = (
+            "import importlib.util, subprocess, sys\n"
+            "spec = importlib.util.spec_from_file_location('st', '/opt/safetorrent/st-guest.py')\n"
+            "st = importlib.util.module_from_spec(spec); spec.loader.exec_module(st)\n"
+            f"own = st.Path('{base}/a/extracted')\n"
+            f"script = ('touch {base}/a/extracted/ok && echo own-ok; '\n"
+            f"          'touch {base}/b/files/x && echo OTHER-WRITE; '\n"
+            "          'curl -s -m 5 -o /dev/null https://example.com && echo NETWORK')\n"
+            "argv = st.torrent_unit(['sh', '-c', script], st.step_unit('e2e'), *st.offline_sandbox('1G', own))\n"
+            "sys.exit(subprocess.run(argv, stdin=subprocess.DEVNULL).returncode)\n")
+        vm(f"mkdir -p {base}/a/extracted {base}/b/files && chown torrent:torrent {base}/a/extracted {base}/b/files")
+        vm(f"cat > {base}/probe.py <<'EOF'\n{probe}EOF")
+        out = vm(f"python3 {base}/probe.py", check=False).stdout
+        self.assertIn("own-ok", out)
+        self.assertNotIn("OTHER-WRITE", out)
+        self.assertNotIn("NETWORK", out)
+        self.assertNotEqual(vm(f"test -e {base}/b/files/x", check=False).returncode, 0)
+
     def vpn_on(self) -> bool:
         return "USE_VPN=yes" in (REAL_CONF_DIR / "config").read_text().replace(" ", "")
 

@@ -430,13 +430,36 @@ def step_unit(kind: str, item_id: str = "") -> str:
     return f"{STEP_PREFIX}{kind}-{item_id + '-' if item_id else ''}{secrets.token_hex(4)}"
 
 
+# Every step that touches untrusted data runs with these. A parser compromised by a
+# hostile file can't gain privileges, sees the whole filesystem read-only (except the
+# ReadWritePaths each step adds), and can't touch devices, the kernel or namespaces.
+STEP_SANDBOX = (
+    "NoNewPrivileges=yes", "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes",
+    "ProtectKernelTunables=yes", "ProtectKernelModules=yes", "ProtectKernelLogs=yes", "ProtectControlGroups=yes",
+    "RestrictSUIDSGID=yes", "RestrictNamespaces=yes", "LockPersonality=yes", "CapabilityBoundingSet=",
+    "SystemCallArchitectures=native", "SystemCallFilter=@system-service", "TasksMax=64", "UMask=0077",
+)
+# A second layer behind the firewall: aria2 may reach the internet but never the Mac or the LAN.
+NO_PRIVATE_NETS = ("IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 "
+                   "fc00::/7 fe80::/10")
+
+
+def aria2_sandbox(*writable: Path) -> tuple[str, ...]:
+    return ("ReadWritePaths=" + " ".join(map(str, (*writable, TORRENT_HOME))), NO_PRIVATE_NETS)
+
+
+def offline_sandbox(memory: str, writable: Path | None = None) -> tuple[str, ...]:
+    """7z and ClamAV: no network at all, and write access only to `writable`, if anything."""
+    return ("IPAddressDeny=any", f"MemoryMax={memory}", *([f"ReadWritePaths={writable}"] if writable else []))
+
+
 def torrent_unit(cmd: list[str], unit: str, *props: str, pty: bool = False) -> list[str]:
-    """cmd as the torrent user, in a throwaway systemd unit. runuser leaves a forked or
-    setsid() child running (one could keep a scanned file open for writing); when a
-    unit ends, systemd kills everything in its cgroup."""
+    """cmd as the torrent user, in a throwaway, sandboxed systemd unit. runuser leaves a
+    forked or setsid() child running (one could keep a scanned file open for writing);
+    when a unit ends, systemd kills everything in its cgroup."""
     return ["systemd-run", "--wait", "--pty" if pty else "--pipe", "--collect", "--quiet", f"--unit={unit}",
             "-p", f"User={TORRENT_USER}", "-p", f"Group={TORRENT_USER}", "-p", "KillMode=control-group",
-            *[a for p in props for a in ("-p", p)], "--", *cmd]
+            *[a for p in (*STEP_SANDBOX, *props) for a in ("-p", p)], "--", *cmd]
 
 
 def stop_unit(unit: str) -> None:
@@ -852,7 +875,7 @@ def obtain_torrent(src: Path, cfg: dict) -> bytes:
             f"--dir={tmp}", "--enable-dht=true", f"--dht-file-path={TORRENT_HOME / 'dht.dat'}",
             f"--dht-entry-point={DHT_BOOTSTRAP}", "--bt-enable-lpd=false",
             "--console-log-level=error", "--summary-interval=0", "--quiet=true", magnet,
-        ], step_unit("metadata"), f"RuntimeMaxSec={timeout}")
+        ], step_unit("metadata"), f"RuntimeMaxSec={timeout}", *aria2_sandbox(tmp))
         found = sorted(tmp.glob("*.torrent"))
         if not found:
             die(f"couldn't get the torrent's file list within {timeout}s. The torrent may be dead "
@@ -896,7 +919,7 @@ def download(d: Path, meta: dict, cfg: dict, background: bool = False) -> bool:
         f"--summary-interval={2 if background else 0}",
         f"--show-console-readout={'false' if background else 'true'}",
         str(d / "source.torrent"),
-    ], unit, pty=not background and sys.stdout.isatty())  # a pty keeps aria2's live readout
+    ], unit, *aria2_sandbox(files_dir), pty=not background and sys.stdout.isatty())  # a pty keeps aria2's live readout
     out = open(log, "w") if background else None
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT if out else None)
     ok, reason = False, None
@@ -992,7 +1015,7 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
         src = root / rel
         dest = extracted_root / (rel + ".d") if depth == 0 else src.parent / (src.name + ".d")
         listing = run_step([sevenz, "l", "-slt", NOPASS, "--", str(src)], step_unit("7z", d.name),
-                           capture_output=True, text=True, errors="replace")
+                           *offline_sandbox("1G"), capture_output=True, text=True, errors="replace")
         text = listing.stdout + listing.stderr
         if re.search(r"Wrong password|Encrypted = \+|Can not open encrypted", text):
             out.append(finding(DANGER, rel, "password-protected archive: can't be scanned (a common way to smuggle malware)",
@@ -1015,7 +1038,8 @@ def extract_archives(d: Path, files: list[tuple[str, int]], root: Path, cfg: dic
                                             "(possible tampering)"))
             continue
         res = run_step([sevenz, "x", "-y", NOPASS, f"-o{dest}", "--", str(src)], step_unit("7z", d.name),
-                       "RuntimeMaxSec=3600", capture_output=True, text=True, errors="replace")
+                       "RuntimeMaxSec=3600", *offline_sandbox("1G", extracted_root),
+                       capture_output=True, text=True, errors="replace")
         if res.returncode != 0:
             if re.search(r"Wrong password|encrypted", res.stdout + res.stderr, re.I):
                 out.append(finding(DANGER, rel, "password-protected archive: can't be scanned", encrypted=True))
@@ -1092,7 +1116,8 @@ def clamav_scan(d: Path, on_wait=None, flagged: frozenset = frozenset()) -> list
         *map(str, roots),
     ]
     with scan_lock(on_wait):
-        res = run_step(cmd, step_unit("clamav", d.name), capture_output=True, text=True, errors="replace")
+        res = run_step(cmd, step_unit("clamav", d.name), *offline_sandbox("2G"),
+                       capture_output=True, text=True, errors="replace")
     skipped: list[str] = []
     detected = False
     reported: collections.Counter[str] = collections.Counter()

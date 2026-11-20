@@ -176,6 +176,80 @@ class Download(Base):
         killpg.assert_not_called()
 
 
+def unit_props(argv: list) -> list:
+    return [argv[i + 1] for i, a in enumerate(argv[:argv.index("--")]) if a == "-p"]
+
+
+def writable(argv: list) -> set:
+    paths = [p[len("ReadWritePaths="):].split() for p in unit_props(argv) if p.startswith("ReadWritePaths=")]
+    return {Path(x) for group in paths for x in group}
+
+
+class StepSandbox(Base):
+    """What a compromised aria2, 7z or ClamAV could still do: as little as possible."""
+
+    def steps(self):
+        """The systemd-run argv of a download, both 7z calls and ClamAV, for one item."""
+        from test_scan import Fake7z, Usage  # the scan tests' fakes
+        d = self.quarantine / "abcdef0123"
+        (d / "files").mkdir(parents=True)
+        (d / "files" / "a.zip").write_bytes(b"archive")
+        with mock.patch.object(st.subprocess, "Popen", return_value=FakeAria2(0)) as popen:
+            st.download(d, {"id": "abcdef0123", "total": 10, "status": "prechecked"}, dict(st.DEFAULTS), background=True)
+        aria2 = popen.call_args.args[0]
+        fake = Fake7z({"a.zip": {"files": {"x.txt": b"x"}}})
+        with mock.patch.object(st, "run", side_effect=fake), \
+                mock.patch.object(st.shutil, "which", return_value="/usr/bin/7z"), \
+                mock.patch.object(st.shutil, "disk_usage", return_value=Usage(0, 0, 10**12)):
+            st.extract_archives(d, [("a.zip", 100)], d / "files", {"MAX_EXTRACT_GB": 20}, "media")
+        listing, unpack = [c for c in fake.commands if "/usr/bin/7z" in c]
+        db = self.tmp / "clamav"
+        db.mkdir()
+        (db / "daily.cld").write_text("x")
+        with mock.patch.object(st, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
+                mock.patch.object(st, "CLAMAV_DB", db), mock.patch.object(st, "SCAN_LOCK", self.tmp / "lock"):
+            st.clamav_scan(d)
+        clam = next(c.args[0] for c in run.call_args_list if "clamscan" in c.args[0])
+        return d, {"aria2": aria2, "7z-list": listing, "7z-unpack": unpack, "clamscan": clam}
+
+    def test_every_step_unit_has_the_baseline_sandbox(self):
+        _d, steps = self.steps()
+        for name, argv in steps.items():
+            with self.subTest(name):
+                self.assertEqual(argv[0], "systemd-run")
+                self.assertTrue(set(st.STEP_SANDBOX) <= set(unit_props(argv)), unit_props(argv))
+
+    def test_unpack_and_scan_have_no_network(self):
+        _d, steps = self.steps()
+        for name in ("7z-list", "7z-unpack", "clamscan"):
+            with self.subTest(name):
+                self.assertIn("IPAddressDeny=any", unit_props(steps[name]))
+
+    def test_only_the_unpacker_can_write_and_only_to_extracted(self):
+        d, steps = self.steps()
+        self.assertEqual(writable(steps["7z-unpack"]), {d / "extracted"})
+        self.assertEqual(writable(steps["7z-list"]), set())
+        self.assertEqual(writable(steps["clamscan"]), set())
+
+    def test_aria2_can_only_write_its_own_download(self):
+        d, steps = self.steps()
+        self.assertEqual(writable(steps["aria2"]), {d / "files", self.state / "torrent"})
+        self.assertIn(st.NO_PRIVATE_NETS, unit_props(steps["aria2"]))
+
+    def test_metadata_fetch_writes_only_its_temp_folder(self):
+        def aria2(cmd, **kw):
+            dest = Path(next(a for a in cmd if a.startswith("--dir="))[6:])
+            self.assertEqual(writable(cmd), {dest, self.state / "torrent"})
+            self.assertTrue(set(st.STEP_SANDBOX) <= set(unit_props(cmd)))
+            (dest / "x.torrent").write_bytes(b"d4:infodee")
+            return ok(cmd)
+        self.run.side_effect = aria2
+        src = self.tmp / "src.magnet"
+        src.write_text("magnet:?xt=urn:btih:" + "a" * 40)
+        with mock.patch("builtins.print"):
+            self.assertEqual(st.obtain_torrent(src, dict(st.DEFAULTS)), b"d4:infodee")
+
+
 class SecureLayout(Base):
     """Migrating a VM set up before the torrent user lost these folders."""
 
